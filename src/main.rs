@@ -4,9 +4,14 @@ use std::io::{BufReader, Read, Seek, Write};
 use std::net::UdpSocket;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
 use linuxvideo::Device;
+#[cfg(target_os = "linux")]
 use linuxvideo::format::PixelFormat;
+#[cfg(target_os = "linux")]
 use linuxvideo::format::PixFormat;
+#[cfg(target_os = "linux")]
 use linuxvideo::stream::ReadStream;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
@@ -223,11 +228,13 @@ impl LatencyStats {
 pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(addr)?;
+    socket.set_nonblocking(true)?;
 
     let mut frame = vec![0u8; FRAME_SIZE];
     let mut datagram = vec![0u8; DATAGRAM_MAX];
+    let mut echo = vec![0u8; 12];
+    let mut stats = LatencyStats::new();
     let mut frame_id: u32 = 0;
-
     loop {
         capture.next_frame(&mut frame)?;
         let capture_ts = now_nanos();
@@ -241,7 +248,6 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
 
 
         for (i, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
-
             let hdr = PacketHeader {
                 frame_id,
                 capture_ts,
@@ -254,7 +260,10 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
             datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
             socket.send(&datagram[..HEADER_BYTES + chunk.len()])?;
         }
-        
+        while let Ok(_) =socket.recv(&mut echo) {
+            let sent_ts = u64::from_be_bytes(echo[4..12].try_into().unwrap());
+            stats.record((now_nanos()-sent_ts) as f64/2_000_000.0);
+        }
         frame_id = frame_id.wrapping_add(1);
     }
 }
@@ -267,10 +276,10 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut decompressed = Vec::with_capacity(FRAME_SIZE);
-
+    let mut echo = [0u8; 12];
 
     loop {
-        let n = socket.recv(&mut buf)?;
+        let (n, src) = socket.recv_from(&mut buf)?;
 
         let hdr = match PacketHeader::decode(&buf[..n]) {
             Some(h) => h,
@@ -299,8 +308,10 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
         }
 
         if reasm.add(&hdr, &buf[HEADER_BYTES..payload_end]) {
-            stats.record((now_nanos() - hdr.capture_ts) as f64/ 1_000_000.0);
-
+            // stats.record((now_nanos() - hdr.capture_ts) as f64/ 1_000_000.0);
+            echo[0..4].copy_from_slice(&hdr.frame_id.to_be_bytes());
+            echo[4..12].copy_from_slice(&hdr.capture_ts.to_be_bytes());
+            let _ = socket.send_to(&echo, src);
             match decompress(&reasm.buf[..reasm.bytes], &mut decompressed) {
                 Ok(()) => {
                     if decompressed.len() != FRAME_SIZE {
@@ -313,7 +324,6 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
                             out.write_all(&decompressed)?;
                             out.flush()?;
                         }
-                        
                     }
                 }
                 Err(e) => eprintln!("decompress failed for frame {}: {}", reasm.frame_id, e)
@@ -322,10 +332,11 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
     }
 }
 
+#[cfg(target_os = "linux")]
 pub struct V4l2Capture {
     stream: ReadStream,
 }
-
+#[cfg(target_os = "linux")]
 impl V4l2Capture {
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Device::open(path)?;
@@ -345,7 +356,7 @@ impl V4l2Capture {
         Ok(Self { stream })
     }
 }
-
+#[cfg(target_os = "linux")]
 impl Capture for V4l2Capture {
     fn next_frame(&mut self, out: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
         self.stream.dequeue(|buf| {
@@ -434,34 +445,6 @@ pub fn display() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
@@ -471,8 +454,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             streaming(&mut capture, "0.0.0.0")?;
         }
         Some("recv") => receiving(None)?,
+        #[cfg(target_os = "linux")]
         Some("cam") => {
-            let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1")
+            let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1");
             let mut capture =   V4l2Capture::open("/dev/video0")?;
             streaming(&mut capture, addr)?;
         },

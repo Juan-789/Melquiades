@@ -259,7 +259,7 @@ pub fn streaming(capture: &mut impl Capture) -> Result<(), Box<dyn std::error::E
     }
 }
 
-pub fn receiving(txt: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:5000")?;
     let mut buf = vec![0u8; DATAGRAM_MAX];
     let mut reasm = Reassembler::new();
@@ -303,8 +303,18 @@ pub fn receiving(txt: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::er
 
             match decompress(&reasm.buf[..reasm.bytes], &mut decompressed) {
                 Ok(()) => {
-                    out.write_all(&decompressed)?;
-                    out.flush()?;
+                    if decompressed.len() != FRAME_SIZE {
+                        eprintln!("frame {} wrong size: {}", hdr.frame_id, decompressed.len());
+                        continue;
+                    }
+                    match &tx {
+                        Some(tx) => {let _ = tx.try_send(decompressed.clone());}
+                        None => {
+                            out.write_all(&decompressed)?;
+                            out.flush()?;
+                        }
+                        
+                    }
                 }
                 Err(e) => eprintln!("decompress failed for frame {}: {}", reasm.frame_id, e)
             }
@@ -388,13 +398,14 @@ pub fn display() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
 
     std::thread::spawn(move || {
-        // your existing receiving() loop, but instead of write_all:
-        //   let _ = tx.try_send(decompressed.clone());
-        // try_send, not send — never block the receiver
+        if let Err(e) = receiving(Some(tx)) {
+            eprintln!("receiver died: {}", e);
+        }
     });
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new()
+        .with_title("Melquiades")
         .with_inner_size(LogicalSize::new(WIDTH as u32, HEIGHT as u32))
         .build(&event_loop)?;
 
@@ -415,7 +426,6 @@ pub fn display() -> Result<(), Box<dyn std::error::Error>> {
                     yuyv_to_rgb(&frame, &mut buffer);
                     buffer.present().unwrap();
                 }
-                window.request_redraw();
             }
             _ => {}
         }
@@ -460,11 +470,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut capture = FileCapture::open("raw_frames.bin")?;
             streaming(&mut capture)?;
         }
-        Some("recv") => receiving()?,
+        Some("recv") => receiving(None)?,
         Some("cam") => {
             let mut capture =   V4l2Capture::open("/dev/video0")?;
             streaming(&mut capture)?;
-        }
+        },
+        Some("display") => display()?,
         _ => {
             eprintln!("Gotta pick either [send|recv]");
             std::process::exit(1);

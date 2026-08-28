@@ -220,9 +220,9 @@ impl LatencyStats {
 // Send / receive
 // ---------------------------------------------------------------------------
 
-pub fn streaming(capture: &mut impl Capture) -> Result<(), Box<dyn std::error::Error>> {
+pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("127.0.0.1:5000")?;
+    socket.connect(addr)?;
 
     let mut frame = vec![0u8; FRAME_SIZE];
     let mut datagram = vec![0u8; DATAGRAM_MAX];
@@ -468,12 +468,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.get(1).map(|s| s.as_str()) {
         Some("send") => {
             let mut capture = FileCapture::open("raw_frames.bin")?;
-            streaming(&mut capture)?;
+            streaming(&mut capture, "0.0.0.0")?;
         }
         Some("recv") => receiving(None)?,
         Some("cam") => {
+            let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1")
             let mut capture =   V4l2Capture::open("/dev/video0")?;
-            streaming(&mut capture)?;
+            streaming(&mut capture, addr)?;
         },
         Some("display") => display()?,
         _ => {

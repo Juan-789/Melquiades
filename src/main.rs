@@ -5,23 +5,24 @@ use std::net::UdpSocket;
 use std::thread::sleep;
 use std::time::Duration;
 
-
-const FRAME_SIZE: usize = 1536;
+const WIDTH: usize = 640;
+const HEIGHT: usize = 640;
+const FRAME_SIZE: usize = WIDTH*HEIGHT;
 
 //wire format the format at which the packets will look like 
 #[repr(C)]
 struct Packet {
     frame_number: u32,   //ig this could loopback and have no problem
-    payload: [u8; 1536],  //maybe less considering our initial test is small
+    payload: [u8; FRAME_SIZE],  //maybe less considering our initial test is small
 }
 impl Packet {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len()<1536+4{
+        if bytes.len()<FRAME_SIZE+4{
             return None; //corrupt case
         }
         let frame_number=u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-        let mut payload = [0u8; 1536];
-        payload.copy_from_slice(&bytes[4..4+1536]);
+        let mut payload = [0u8; FRAME_SIZE];
+        payload.copy_from_slice(&bytes[4..4+FRAME_SIZE]);
 
         return Some(Self { frame_number, payload })
     }
@@ -32,6 +33,10 @@ impl Packet {
         out[4..4+1536].copy_from_slice(&self.payload);
     }
 }
+pub trait Capture {
+    fn next_frame(&mut self, out: &mut [u8]) -> Result<(), Box< dyn  std::error::Error>>;
+}
+
 
 pub fn streaming() -> Result<(), Box<dyn std::error::Error>>{
     let file= File::open("raw_frames.bin")?; // would be easy to read all this but we can simulate like as if it was reading realtime by adding time

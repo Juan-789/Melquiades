@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::mpsc::SyncSender;
+use std::time::Instant;
 
 use crate::capture::Capture;
 use crate::compression::{compress, decompress};
@@ -8,7 +9,7 @@ use crate::config::{
     CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
     MAX_CHUNK_PAYLOAD,
 };
-use crate::metrics::LatencyStats;
+use crate::metrics::{FrameTimings, LatencyStats};
 use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
 use crate::wire::{FrameEcho, PacketHeader};
@@ -73,7 +74,12 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
     }
 }
 
-pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::error::Error>> {
+pub struct ReceivedFrame {
+    pub pixels: Vec<u8>,
+    pub timings: FrameTimings,
+}
+
+pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:5000")?;
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut reassembler = Reassembler::new();
@@ -114,10 +120,15 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        let t0_compressed_frame_complete = Instant::now();
         let spread_us = ((now_nanos() - reassembler.first_chunk_ns) / 1_000) as u32;
-        let started = now_nanos();
+        let t1_decode_begins = Instant::now();
         let result = decompress(&reassembler.buf[..reassembler.bytes], &mut decompressed);
-        let decompress_us = ((now_nanos() - started) / 1_000) as u32;
+        let t2_decode_ends = Instant::now();
+        let decompress_us = t2_decode_ends
+            .duration_since(t1_decode_begins)
+            .as_micros()
+            .min(u32::MAX as u128) as u32;
         match result {
             Ok(()) => {
                 if decompressed.len() != FRAME_SIZE {
@@ -138,7 +149,15 @@ pub fn receiving(tx: Option<SyncSender<Vec<u8>>>) -> Result<(), Box<dyn std::err
                 let _ = socket.send_to(&echo_bytes, source);
                 match &tx {
                     Some(tx) => {
-                        let _ = tx.try_send(decompressed.clone());
+                        let frame = ReceivedFrame {
+                            pixels: decompressed.clone(),
+                            timings: FrameTimings {
+                                t0_compressed_frame_complete,
+                                t1_decode_begins,
+                                t2_decode_ends,
+                            },
+                        };
+                        let _ = tx.try_send(frame);
                     }
                     None => {
                         output.write_all(&decompressed)?;

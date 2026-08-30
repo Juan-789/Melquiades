@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::time::Instant;
 use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -6,10 +7,11 @@ use winit::window::WindowBuilder;
 
 use crate::color::yuyv_to_rgb;
 use crate::config::{HEIGHT, WIDTH};
-use crate::transport::receiving;
+use crate::metrics::PipelineStats;
+use crate::transport::{ReceivedFrame, receiving};
 
 pub fn display() -> Result<(), Box<dyn std::error::Error>> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<ReceivedFrame>(1);
     std::thread::spawn(move || {
         if let Err(error) = receiving(Some(sender)) {
             eprintln!("receiver died: {}", error);
@@ -26,6 +28,7 @@ pub fn display() -> Result<(), Box<dyn std::error::Error>> {
         NonZeroU32::new(WIDTH as u32).unwrap(),
         NonZeroU32::new(HEIGHT as u32).unwrap(),
     )?;
+    let mut pipeline_stats = PipelineStats::new();
     event_loop.run(move |event, event_loop| {
         event_loop.set_control_flow(ControlFlow::Poll);
         match event {
@@ -36,8 +39,11 @@ pub fn display() -> Result<(), Box<dyn std::error::Error>> {
             Event::AboutToWait => {
                 if let Ok(frame) = receiver.try_recv() {
                     let mut buffer = surface.buffer_mut().unwrap();
-                    yuyv_to_rgb(&frame, &mut buffer);
+                    yuyv_to_rgb(&frame.pixels, &mut buffer);
+                    let t3_gpu_submission = Instant::now();
                     buffer.present().unwrap();
+                    let t4_present_returned = Instant::now();
+                    pipeline_stats.record(&frame.timings, t3_gpu_submission, t4_present_returned);
                 }
             }
             _ => {}

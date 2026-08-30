@@ -13,6 +13,24 @@ use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
 use crate::wire::{FrameEcho, PacketHeader};
 
+fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
+    loop {
+        match socket.send(datagram) {
+            Ok(sent) if sent == datagram.len() => return Ok(()),
+            Ok(sent) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("UDP send wrote {sent} of {} bytes", datagram.len()),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(addr)?;
@@ -43,7 +61,7 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
             };
             header.encode(&mut datagram[..HEADER_BYTES]);
             datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
-            socket.send(&datagram[..HEADER_BYTES + chunk.len()])?;
+            send_datagram(&socket, &datagram[..HEADER_BYTES + chunk.len()])?;
         }
         while let Ok(received) = socket.recv(&mut echo_bytes) {
             if let Some(echo) = FrameEcho::decode(&echo_bytes[..received]) {

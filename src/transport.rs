@@ -9,7 +9,7 @@ use crate::config::{
     CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
     MAX_CHUNK_PAYLOAD,
 };
-use crate::metrics::{FrameTimings, LatencyStats};
+use crate::metrics::{CompressionStats, FrameTimings, LatencyStats};
 use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
 use crate::wire::{FrameEcho, PacketHeader};
@@ -40,17 +40,27 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut stats = LatencyStats::new();
+    let mut compression_stats = CompressionStats::new();
     let mut frame_id = 0_u32;
 
     loop {
         capture.next_frame(&mut frame)?;
         let capture_ts = now_nanos();
+        let compression_started = Instant::now();
         let compressed = compress(&frame)?;
+        let compression_ended = Instant::now();
         let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
         if total_chunks > CHUNKS_PER_FRAME {
             eprintln!("frame {} too large: {} chunks", frame_id, total_chunks);
             continue;
         }
+        compression_stats.record(
+            frame.len(),
+            compressed.len(),
+            total_chunks,
+            HEADER_BYTES,
+            compression_ended.duration_since(compression_started),
+        );
         for (index, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
             let header = PacketHeader {
                 frame_id,

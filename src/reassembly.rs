@@ -1,5 +1,6 @@
+use std::time::Instant;
+
 use crate::config::{CHUNKS_PER_FRAME, FRAME_SIZE, MAX_CHUNK_PAYLOAD};
-use crate::time::now_nanos;
 use crate::wire::PacketHeader;
 
 pub struct Reassembler {
@@ -9,7 +10,7 @@ pub struct Reassembler {
     count: u16,
     pub total_chunks: u16,
     pub bytes: usize,
-    pub first_chunk_ns: u64,
+    pub first_chunk_at: Option<Instant>,
 }
 
 impl Reassembler {
@@ -21,7 +22,7 @@ impl Reassembler {
             count: 0,
             total_chunks: 0,
             bytes: 0,
-            first_chunk_ns: 0,
+            first_chunk_at: None,
         }
     }
 
@@ -31,7 +32,7 @@ impl Reassembler {
         self.count = 0;
         self.total_chunks = 0;
         self.bytes = 0;
-        self.first_chunk_ns = 0;
+        self.first_chunk_at = None;
     }
 
     pub fn add(&mut self, header: &PacketHeader, payload: &[u8]) -> bool {
@@ -45,7 +46,7 @@ impl Reassembler {
             return false;
         }
         if self.count == 0 {
-            self.first_chunk_ns = now_nanos();
+            self.first_chunk_at = Some(Instant::now());
         }
         let offset = index * MAX_CHUNK_PAYLOAD;
         self.buf[offset..offset + payload.len()].copy_from_slice(payload);
@@ -58,5 +59,9 @@ impl Reassembler {
 
     pub fn missing(&self) -> u16 {
         self.total_chunks.saturating_sub(self.count)
+    }
+
+    pub fn is_newer_frame(&self, candidate: u32) -> bool {
+        candidate != self.frame_id && candidate.wrapping_sub(self.frame_id) < (1_u32 << 31)
     }
 }

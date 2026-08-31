@@ -9,7 +9,7 @@ use crate::config::{
     CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
     MAX_CHUNK_PAYLOAD,
 };
-use crate::metrics::{CompressionStats, FrameTimings, LatencyStats};
+use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
 use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
 use crate::wire::{FrameEcho, PacketHeader};
@@ -39,16 +39,18 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
     let mut frame = vec![0; FRAME_SIZE];
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut echo_bytes = [0; ECHO_BYTES];
-    let mut stats = LatencyStats::new();
     let mut compression_stats = CompressionStats::new();
+    let mut sender_stats = SenderStats::new();
     let mut frame_id = 0_u32;
 
     loop {
+        let s0_capture_begins = Instant::now();
         capture.next_frame(&mut frame)?;
+        let s1_frame_acquired = Instant::now();
         let capture_ts = now_nanos();
-        let compression_started = Instant::now();
+        let s2_compression_begins = Instant::now();
         let compressed = compress(&frame)?;
-        let compression_ended = Instant::now();
+        let s3_compression_ends = Instant::now();
         let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
         if total_chunks > CHUNKS_PER_FRAME {
             eprintln!("frame {} too large: {} chunks", frame_id, total_chunks);
@@ -59,8 +61,10 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
             compressed.len(),
             total_chunks,
             HEADER_BYTES,
-            compression_ended.duration_since(compression_started),
+            s3_compression_ends.duration_since(s2_compression_begins),
         );
+        let mut first_datagram_accepted = None;
+        let mut final_datagram_accepted = None;
         for (index, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
             let header = PacketHeader {
                 frame_id,
@@ -73,12 +77,24 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
             header.encode(&mut datagram[..HEADER_BYTES]);
             datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
             send_datagram(&socket, &datagram[..HEADER_BYTES + chunk.len()])?;
+            let accepted_at = Instant::now();
+            first_datagram_accepted.get_or_insert(accepted_at);
+            final_datagram_accepted = Some(accepted_at);
         }
+        sender_stats.record(&SenderTimings {
+            s0_capture_begins,
+            s1_frame_acquired,
+            s2_compression_begins,
+            s3_compression_ends,
+            s4_first_datagram_accepted: first_datagram_accepted
+                .expect("a compressed frame must contain at least one datagram"),
+            s5_final_datagram_accepted: final_datagram_accepted
+                .expect("a compressed frame must contain at least one datagram"),
+        });
         while let Ok(received) = socket.recv(&mut echo_bytes) {
-            if let Some(echo) = FrameEcho::decode(&echo_bytes[..received]) {
-                let _telemetry = (echo.frame_id, echo.spread_us, echo.decompress_us);
-                stats.record((now_nanos() - echo.capture_ts) as f64 / 2_000_000.0);
-            }
+            // Drain receipts so they do not accumulate. Cross-machine and delayed-read
+            // timing is intentionally not reported as one-way latency.
+            let _ = FrameEcho::decode(&echo_bytes[..received]);
         }
         frame_id = frame_id.wrapping_add(1);
     }
@@ -97,6 +113,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
     let mut output = stdout.lock();
     let mut decompressed = Vec::with_capacity(FRAME_SIZE);
     let mut echo_bytes = [0; ECHO_BYTES];
+    let mut reassembly_stats = ReassemblyStats::new();
 
     loop {
         let (received, source) = socket.recv_from(&mut datagram)?;
@@ -108,7 +125,12 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
             }
         };
         if header.frame_id != reassembler.frame_id {
+            if !reassembler.is_newer_frame(header.frame_id) {
+                reassembly_stats.record_late_packet();
+                continue;
+            }
             if reassembler.total_chunks > 0 && reassembler.missing() > 0 {
+                reassembly_stats.record_drop(reassembler.missing());
                 eprintln!(
                     "frame {} dropped: {} of {} chunks missing",
                     reassembler.frame_id,
@@ -131,7 +153,14 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
         }
 
         let t0_compressed_frame_complete = Instant::now();
-        let spread_us = ((now_nanos() - reassembler.first_chunk_ns) / 1_000) as u32;
+        let first_chunk_at = reassembler
+            .first_chunk_at
+            .expect("a complete frame must have a first chunk timestamp");
+        reassembly_stats.record_complete(first_chunk_at, t0_compressed_frame_complete);
+        let spread_us = t0_compressed_frame_complete
+            .duration_since(first_chunk_at)
+            .as_micros()
+            .min(u32::MAX as u128) as u32;
         let t1_decode_begins = Instant::now();
         let result = decompress(&reassembler.buf[..reassembler.bytes], &mut decompressed);
         let t2_decode_ends = Instant::now();

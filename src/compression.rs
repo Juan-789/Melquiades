@@ -5,7 +5,7 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 
 pub fn compress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(bytes)?;
     encoder.finish()
 }

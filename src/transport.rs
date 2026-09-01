@@ -3,7 +3,7 @@ use std::net::UdpSocket;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
-use crate::capture::Capture;
+use crate::capture::{FrameSlot, FrameSource, PixelFormat};
 use crate::compression::{compress, decompress};
 use crate::config::{
     CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
@@ -32,11 +32,14 @@ fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     }
 }
 
-pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn streaming(
+    source: &mut impl FrameSource,
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(addr)?;
     socket.set_nonblocking(true)?;
-    let mut frame = vec![0; FRAME_SIZE];
+    let mut frame = FrameSlot::new(FRAME_SIZE);
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut compression_stats = CompressionStats::new();
@@ -45,11 +48,18 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
 
     loop {
         let s0_capture_begins = Instant::now();
-        capture.next_frame(&mut frame)?;
-        let s1_frame_acquired = Instant::now();
+        let frame_info = source.next_frame(&mut frame)?;
+        let s1_frame_acquired = frame_info.captured_at;
+        validate_current_stream_format(
+            frame_info.width,
+            frame_info.height,
+            frame_info.format,
+            frame_info.byte_len,
+        )?;
+        let frame_bytes = frame.bytes(frame_info.byte_len)?;
         let capture_ts = now_nanos();
         let s2_compression_begins = Instant::now();
-        let compressed = compress(&frame)?;
+        let compressed = compress(frame_bytes)?;
         let s3_compression_ends = Instant::now();
         let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
         if total_chunks > CHUNKS_PER_FRAME {
@@ -57,7 +67,7 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
             continue;
         }
         compression_stats.record(
-            frame.len(),
+            frame_info.byte_len,
             compressed.len(),
             total_chunks,
             HEADER_BYTES,
@@ -98,6 +108,30 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
         }
         frame_id = frame_id.wrapping_add(1);
     }
+}
+
+/// The capture boundary is format-aware, while the current wire format and
+/// receiver are intentionally still fixed to the first YUYV experiment.
+/// A later protocol revision will carry this metadata alongside each frame.
+fn validate_current_stream_format(
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    byte_len: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if width != crate::config::WIDTH as u32
+        || height != crate::config::HEIGHT as u32
+        || format != PixelFormat::Yuyv422
+        || byte_len != FRAME_SIZE
+    {
+        return Err(format!(
+            "current transport accepts only {}x{} YUYV frames of {FRAME_SIZE} bytes; source produced {width}x{height} {format:?} with {byte_len} bytes",
+            crate::config::WIDTH,
+            crate::config::HEIGHT,
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub struct ReceivedFrame {

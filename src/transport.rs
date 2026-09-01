@@ -7,7 +7,7 @@ use crate::capture::{FrameSlot, FrameSource, PixelFormat};
 use crate::compression::{compress, decompress};
 use crate::config::{
     CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
-    MAX_CHUNK_PAYLOAD,
+    INTER_PACKET_GAP_US, MAX_CHUNK_PAYLOAD,
 };
 use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
 use crate::reassembly::Reassembler;
@@ -32,6 +32,16 @@ fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Keep the next packet out of the kernel until the configured gap has passed.
+/// A spin wait is intentional here: `thread::sleep` is far too imprecise for a
+/// 25 microsecond experiment and would measure scheduler wake-up latency too.
+fn pace_after_send(sent_at: Instant) {
+    let next_send_at = sent_at + std::time::Duration::from_micros(INTER_PACKET_GAP_US);
+    while Instant::now() < next_send_at {
+        std::hint::spin_loop();
+    }
+}
+
 pub fn streaming(
     source: &mut impl FrameSource,
     addr: &str,
@@ -45,6 +55,8 @@ pub fn streaming(
     let mut compression_stats = CompressionStats::new();
     let mut sender_stats = SenderStats::new();
     let mut frame_id = 0_u32;
+
+    eprintln!("inter-packet pacing: {INTER_PACKET_GAP_US}us (spin wait)");
 
     loop {
         let s0_capture_begins = Instant::now();
@@ -90,6 +102,9 @@ pub fn streaming(
             let accepted_at = Instant::now();
             first_datagram_accepted.get_or_insert(accepted_at);
             final_datagram_accepted = Some(accepted_at);
+            if index + 1 < total_chunks {
+                pace_after_send(accepted_at);
+            }
         }
         sender_stats.record(&SenderTimings {
             s0_capture_begins,

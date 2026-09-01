@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+flate2 = "1.1.10"
+softbuffer = "0.4"
+winit = "0.29"
+
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linuxvideo = "0.3.5"

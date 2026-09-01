@@ -153,12 +153,13 @@ mod linux {
         ) -> Result<FrameInfo, Box<dyn std::error::Error>> {
             self.stream.dequeue(|buf| {
                 if buf.len() < FRAME_SIZE {
-                    return Err(format!(
-                        "camera returned {} bytes, need {FRAME_SIZE}",
-                        buf.len()
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("camera returned {} bytes, need {FRAME_SIZE}", buf.len()),
                     ));
                 }
-                slot.bytes_mut(FRAME_SIZE)?
+                slot.bytes_mut(FRAME_SIZE)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
                     .copy_from_slice(&buf[..FRAME_SIZE]);
                 Ok(())
             })?;

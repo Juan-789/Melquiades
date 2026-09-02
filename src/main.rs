@@ -5,6 +5,7 @@ mod config;
 mod display;
 mod metrics;
 mod reassembly;
+mod spsc;
 mod time;
 mod transport;
 mod wire;

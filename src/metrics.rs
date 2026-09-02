@@ -18,30 +18,32 @@ pub struct SenderTimings {
 }
 
 pub struct SenderStats {
-    capture: Vec<f64>,
-    preparation: Vec<f64>,
+    capture_wait: Vec<f64>,
+    handoff_to_compression: Vec<f64>,
     compression: Vec<f64>,
     compression_to_first_send: Vec<f64>,
     send_loop: Vec<f64>,
-    total: Vec<f64>,
+    sender_total: Vec<f64>,
+    frame_path: Vec<f64>,
 }
 
 impl SenderStats {
     pub fn new() -> Self {
         Self {
-            capture: samples(),
-            preparation: samples(),
+            capture_wait: samples(),
+            handoff_to_compression: samples(),
             compression: samples(),
             compression_to_first_send: samples(),
             send_loop: samples(),
-            total: samples(),
+            sender_total: samples(),
+            frame_path: samples(),
         }
     }
 
     pub fn record(&mut self, timing: &SenderTimings) {
-        self.capture
+        self.capture_wait
             .push(between(timing.s0_capture_begins, timing.s1_frame_acquired));
-        self.preparation.push(between(
+        self.handoff_to_compression.push(between(
             timing.s1_frame_acquired,
             timing.s2_compression_begins,
         ));
@@ -57,15 +59,27 @@ impl SenderStats {
             timing.s4_first_datagram_accepted,
             timing.s5_final_datagram_accepted,
         ));
-        self.total.push(between(
+        self.sender_total.push(between(
+            timing.s2_compression_begins,
+            timing.s5_final_datagram_accepted,
+        ));
+        self.frame_path.push(between(
             timing.s0_capture_begins,
             timing.s5_final_datagram_accepted,
         ));
 
-        if self.total.len() == REPORT_FRAMES {
-            eprintln!("sender pipeline over {REPORT_FRAMES} transmitted frames:");
-            report("S0→S1 capture_wait", &mut self.capture, "us");
-            report("S1→S2 ready_to_compression", &mut self.preparation, "us");
+        if self.frame_path.len() == REPORT_FRAMES {
+            eprintln!("capture stage over {REPORT_FRAMES} transmitted frames:");
+            report("C0→C1 capture_wait", &mut self.capture_wait, "us");
+
+            eprintln!("capture-to-sender handoff over {REPORT_FRAMES} transmitted frames:");
+            report(
+                "C1→S2 ready_to_compression",
+                &mut self.handoff_to_compression,
+                "us",
+            );
+
+            eprintln!("sender work over {REPORT_FRAMES} transmitted frames:");
             report("S2→S3 compression", &mut self.compression, "us");
             report(
                 "S3→S4 packetize_to_first_socket_accept",
@@ -73,7 +87,14 @@ impl SenderStats {
                 "us",
             );
             report("S4→S5 send_loop", &mut self.send_loop, "us");
-            report("S0→S5 sender_total", &mut self.total, "us");
+            report("S2→S5 sender_work_total", &mut self.sender_total, "us");
+
+            eprintln!("per-frame path over {REPORT_FRAMES} transmitted frames:");
+            report(
+                "C0→S5 capture_begin_to_final_socket_accept",
+                &mut self.frame_path,
+                "us",
+            );
         }
     }
 }

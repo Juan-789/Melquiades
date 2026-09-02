@@ -1,5 +1,6 @@
+use std::cell::UnsafeCell;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,8 @@ pub enum PixelFormat {
 /// Metadata for the bytes a source wrote into a [`FrameSlot`].
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInfo {
+    /// When this source started waiting for the frame now in the slot.
+    pub capture_begins_at: Instant,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
@@ -100,24 +103,30 @@ impl FrameSlot {
 ///
 /// This is intentionally distinct from a video frame number: a slot is reused
 /// for many captured frames over the lifetime of the program.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SlotId(u8);
 
 impl SlotId {
-    pub fn index(self) -> usize {
+    fn index(&self) -> usize {
         self.0 as usize
     }
 }
 
 /// Fixed, preallocated storage for raw captured frames.
 ///
-/// The pool owns the pixels; later SPSC rings will carry only [`SlotId`]s.
+/// The pool owns the pixels; SPSC rings carry only [`SlotId`]s.
 /// A `Vec` is appropriate because slot IDs are dense, stable indexes from zero
 /// to `len - 1`. A hash map would add indirection without representing a
 /// problem this pool has.
 pub struct FramePool {
-    slots: Vec<FrameSlot>,
+    slots: Box<[UnsafeCell<FrameSlot>]>,
 }
+
+// A slot is accessed through this shared pool only after a FreeSlots or
+// ReadySlots handoff gives one stage exclusive ownership of its SlotId. The
+// unsafe accessors below make that precondition explicit at the one boundary
+// where shared access becomes a mutable FrameSlot.
+unsafe impl Sync for FramePool {}
 
 impl FramePool {
     pub fn new(slot_count: usize, slot_byte_capacity: usize) -> Self {
@@ -127,29 +136,52 @@ impl FramePool {
             "a u8 SlotId can address at most 256 slots"
         );
 
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            slots.push(FrameSlot::new(slot_byte_capacity));
-        }
+        let slots = (0..slot_count)
+            .map(|_| UnsafeCell::new(FrameSlot::new(slot_byte_capacity)))
+            .collect();
 
         Self { slots }
-    }
-
-    pub fn slot(&self, id: SlotId) -> Option<&FrameSlot> {
-        self.slots.get(id.index())
-    }
-
-    pub fn slot_mut(&mut self, id: SlotId) -> Option<&mut FrameSlot> {
-        self.slots.get_mut(id.index())
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots.len()
     }
 
     /// The IDs used to seed the free-slot SPSC ring at startup.
     pub fn slot_ids(&self) -> impl Iterator<Item = SlotId> + '_ {
         (0..self.slots.len()).map(|index| SlotId(index as u8))
+    }
+
+    /// Gives capture mutable access to a slot it exclusively claimed from
+    /// FreeSlots.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be owned by capture and must not appear in either ring or be
+    /// held by sender. The caller must not let the returned reference escape
+    /// the ownership interval.
+    pub(crate) unsafe fn capture_slot(&self, id: &SlotId) -> &mut FrameSlot {
+        // SAFETY: upheld by the caller's SPSC ownership proof.
+        unsafe { &mut *self.slots[id.index()].get() }
+    }
+
+    /// Gives sender read-only access to a slot it exclusively claimed from
+    /// ReadySlots.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be owned by sender and must not appear in either ring or be
+    /// held by capture. The caller must not let the returned reference escape
+    /// the ownership interval.
+    pub(crate) unsafe fn sender_slot(&self, id: &SlotId) -> &FrameSlot {
+        // SAFETY: upheld by the caller's SPSC ownership proof.
+        unsafe { &*self.slots[id.index()].get() }
+    }
+
+    /// Clears a slot immediately before its ID is returned to FreeSlots.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be exclusively owned by the stage returning it.
+    pub(crate) unsafe fn clear_claimed_slot(&self, id: &SlotId) {
+        // SAFETY: upheld by the caller's SPSC ownership proof.
+        unsafe { (&mut *self.slots[id.index()].get()).clear_info() };
     }
 }
 
@@ -161,6 +193,11 @@ impl FramePool {
 pub trait FrameSource {
     fn next_frame(&mut self, slot: &mut FrameSlot)
     -> Result<FrameInfo, Box<dyn std::error::Error>>;
+
+    /// Waits for and discards one source frame when no pool slot is available.
+    /// This prevents the source driver's own queue from becoming a hidden
+    /// backlog of old video.
+    fn discard_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct FileCapture {
@@ -182,6 +219,19 @@ impl FileCapture {
             index: 0,
         })
     }
+
+    fn begin_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.index >= self.total_frames {
+            self.reader.rewind()?;
+            self.index = 0;
+        }
+        Ok(())
+    }
+
+    fn finish_frame(&mut self) {
+        self.index += 1;
+        sleep(Duration::from_millis(33));
+    }
 }
 
 impl FrameSource for FileCapture {
@@ -189,20 +239,25 @@ impl FrameSource for FileCapture {
         &mut self,
         slot: &mut FrameSlot,
     ) -> Result<FrameInfo, Box<dyn std::error::Error>> {
-        if self.index >= self.total_frames {
-            self.reader.rewind()?;
-            self.index = 0;
-        }
+        let capture_begins_at = Instant::now();
+        self.begin_next_frame()?;
         self.reader.read_exact(slot.bytes_mut(FRAME_SIZE)?)?;
-        self.index += 1;
-        sleep(Duration::from_millis(33));
+        self.finish_frame();
         Ok(FrameInfo {
+            capture_begins_at,
             width: crate::config::WIDTH as u32,
             height: crate::config::HEIGHT as u32,
             format: PixelFormat::Yuyv422,
             byte_len: FRAME_SIZE,
             captured_at: Instant::now(),
         })
+    }
+
+    fn discard_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.begin_next_frame()?;
+        self.reader.seek(SeekFrom::Current(FRAME_SIZE as i64))?;
+        self.finish_frame();
+        Ok(())
     }
 }
 
@@ -244,6 +299,7 @@ mod linux {
             &mut self,
             slot: &mut FrameSlot,
         ) -> Result<FrameInfo, Box<dyn std::error::Error>> {
+            let capture_begins_at = Instant::now();
             self.stream.dequeue(|buf| {
                 if buf.len() < FRAME_SIZE {
                     return Err(std::io::Error::new(
@@ -257,12 +313,18 @@ mod linux {
                 Ok(())
             })?;
             Ok(FrameInfo {
+                capture_begins_at,
                 width: WIDTH as u32,
                 height: HEIGHT as u32,
                 format: PixelFormat::Yuyv422,
                 byte_len: FRAME_SIZE,
                 captured_at: Instant::now(),
             })
+        }
+
+        fn discard_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.stream.dequeue(|_| Ok(()))?;
+            Ok(())
         }
     }
 }

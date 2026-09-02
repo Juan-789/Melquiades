@@ -65,7 +65,7 @@ impl SenderStats {
         if self.total.len() == REPORT_FRAMES {
             eprintln!("sender pipeline over {REPORT_FRAMES} transmitted frames:");
             report("S0→S1 capture_wait", &mut self.capture, "us");
-            report("S1→S2 preparation", &mut self.preparation, "us");
+            report("S1→S2 ready_to_compression", &mut self.preparation, "us");
             report("S2→S3 compression", &mut self.compression, "us");
             report(
                 "S3→S4 packetize_to_first_socket_accept",

@@ -4,11 +4,10 @@ use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::Instant;
 
-use crate::capture::{FrameSource, PixelFormat};
+use crate::capture::{FrameSource, StreamSpec};
 use crate::compression::{compress, decompress};
 use crate::config::{
-    CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
-    INTER_PACKET_GAP_US, MAX_CHUNK_PAYLOAD,
+    DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, HEADER_BYTES, INTER_PACKET_GAP_US, MAX_CHUNK_PAYLOAD,
 };
 use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
 use crate::pipeline::{CapturePort, Pipeline, SenderPort};
@@ -48,7 +47,8 @@ pub fn streaming<S>(source: S, addr: &str) -> Result<(), Box<dyn std::error::Err
 where
     S: FrameSource + Send + 'static,
 {
-    let (capture, sender) = Pipeline::new().into_ports();
+    let stream = source.stream_spec();
+    let (capture, sender) = Pipeline::new(stream).into_ports();
     let capture_thread = thread::Builder::new()
         .name("melquiades-capture".into())
         .spawn(move || {
@@ -60,7 +60,7 @@ where
 
     // Sender runs on the caller's thread. It is concurrent with the dedicated
     // capture thread above, but avoids a third coordinating thread.
-    let result = sender_loop(sender, addr);
+    let result = sender_loop(sender, addr, stream);
     drop(capture_thread);
     result
 }
@@ -74,7 +74,11 @@ fn capture_loop(
     }
 }
 
-fn sender_loop(sender: SenderPort, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn sender_loop(
+    sender: SenderPort,
+    addr: &str,
+    stream: StreamSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(addr)?;
     socket.set_nonblocking(true)?;
@@ -96,18 +100,13 @@ fn sender_loop(sender: SenderPort, addr: &str) -> Result<(), Box<dyn std::error:
         };
 
         let send_result = sender.with_frame(&id, |frame_info, frame_bytes| {
-            validate_current_stream_format(
-                frame_info.width,
-                frame_info.height,
-                frame_info.format,
-                frame_info.byte_len,
-            )?;
+            validate_stream_format(frame_info.stream_spec()?, stream)?;
             let capture_ts = now_nanos();
             let s2_compression_begins = Instant::now();
             let compressed = compress(frame_bytes)?;
             let s3_compression_ends = Instant::now();
             let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
-            if total_chunks > CHUNKS_PER_FRAME {
+            if total_chunks > u16::MAX as usize {
                 eprintln!("frame {} too large: {} chunks", frame_id, total_chunks);
                 return Ok::<(), Box<dyn std::error::Error>>(());
             }
@@ -124,6 +123,7 @@ fn sender_loop(sender: SenderPort, addr: &str) -> Result<(), Box<dyn std::error:
                 let header = PacketHeader {
                     frame_id,
                     capture_ts,
+                    stream,
                     chunk_index: index as u16,
                     total_chunks: total_chunks as u16,
                     chunk_len: chunk.len() as u16,
@@ -171,24 +171,15 @@ fn sender_loop(sender: SenderPort, addr: &str) -> Result<(), Box<dyn std::error:
     }
 }
 
-/// The capture boundary is format-aware, while the current wire format and
-/// receiver are intentionally still fixed to the first YUYV experiment.
-/// A later protocol revision will carry this metadata alongside each frame.
-fn validate_current_stream_format(
-    width: u32,
-    height: u32,
-    format: PixelFormat,
-    byte_len: usize,
+/// The source declares one format for a run. Catch a backend accidentally
+/// changing its capture shape before it can corrupt the fixed pool layout.
+fn validate_stream_format(
+    frame: StreamSpec,
+    configured: StreamSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if width != crate::config::WIDTH as u32
-        || height != crate::config::HEIGHT as u32
-        || format != PixelFormat::Yuyv422
-        || byte_len != FRAME_SIZE
-    {
+    if frame != configured {
         return Err(format!(
-            "current transport accepts only {}x{} YUYV frames of {FRAME_SIZE} bytes; source produced {width}x{height} {format:?} with {byte_len} bytes",
-            crate::config::WIDTH,
-            crate::config::HEIGHT,
+            "source changed stream shape from {configured:?} to {frame:?}; recreate the pipeline for a new resolution"
         )
         .into());
     }
@@ -197,6 +188,7 @@ fn validate_current_stream_format(
 
 pub struct ReceivedFrame {
     pub pixels: Vec<u8>,
+    pub stream: StreamSpec,
     pub timings: FrameTimings,
 }
 
@@ -206,7 +198,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
     let mut reassembler = Reassembler::new();
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    let mut decompressed = Vec::with_capacity(FRAME_SIZE);
+    let mut decompressed = Vec::new();
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut reassembly_stats = ReassemblyStats::new();
 
@@ -233,7 +225,13 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                     reassembler.total_chunks
                 );
             }
-            reassembler.reset(header.frame_id);
+            if !reassembler.reset(&header) {
+                eprintln!(
+                    "refused frame {}: {} chunks exceed the reassembly safety limit",
+                    header.frame_id, header.total_chunks
+                );
+                continue;
+            }
         }
         let payload_end = HEADER_BYTES + header.chunk_len as usize;
         if payload_end > received {
@@ -265,11 +263,12 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
             .min(u32::MAX as u128) as u32;
         match result {
             Ok(()) => {
-                if decompressed.len() != FRAME_SIZE {
+                if decompressed.len() != header.stream.byte_len {
                     eprintln!(
-                        "frame {} wrong size: {}",
+                        "frame {} wrong size: {}, expected {}",
                         header.frame_id,
-                        decompressed.len()
+                        decompressed.len(),
+                        header.stream.byte_len,
                     );
                     continue;
                 }
@@ -285,6 +284,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                     Some(tx) => {
                         let frame = ReceivedFrame {
                             pixels: decompressed.clone(),
+                            stream: header.stream,
                             timings: FrameTimings {
                                 t0_compressed_frame_complete,
                                 t1_decode_begins,

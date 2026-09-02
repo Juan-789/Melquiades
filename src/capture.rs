@@ -4,18 +4,78 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::config::FRAME_SIZE;
+use crate::config::{FRAME_SIZE, MAX_RAW_FRAME_BYTES};
 
 /// Pixel layout supplied by a [`FrameSource`].
-///
-/// The wire protocol currently only carries 640x480 YUYV frames, but capture
-/// backends must describe their native output honestly. A screen-capture
-/// backend, for example, will normally produce BGRA pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // BGRA becomes live with the first screen-capture backend.
 pub enum PixelFormat {
     Yuyv422,
     Bgra8888,
+}
+
+impl PixelFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Yuyv422 => 2,
+            Self::Bgra8888 => 4,
+        }
+    }
+
+    pub const fn wire_code(self) -> u8 {
+        match self {
+            Self::Yuyv422 => 1,
+            Self::Bgra8888 => 2,
+        }
+    }
+
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Yuyv422),
+            2 => Some(Self::Bgra8888),
+            _ => None,
+        }
+    }
+}
+
+/// Pixel geometry and layout agreed at the capture boundary.
+///
+/// A stream chooses one of these at startup. It is also repeated in every
+/// video datagram, so a receiver that starts late can independently validate
+/// the image it is about to allocate and display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamSpec {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub byte_len: usize,
+}
+
+impl StreamSpec {
+    pub fn new(
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if width == 0 || height == 0 || width > u16::MAX as u32 || height > u16::MAX as u32 {
+            return Err(format!("invalid stream dimensions {width}x{height}").into());
+        }
+        let byte_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel()))
+            .ok_or("stream byte length overflow")?;
+        if byte_len > MAX_RAW_FRAME_BYTES {
+            return Err(format!(
+                "{width}x{height} {format:?} needs {byte_len} bytes, above the {MAX_RAW_FRAME_BYTES} byte safety limit"
+            )
+            .into());
+        }
+        Ok(Self {
+            width,
+            height,
+            format,
+            byte_len,
+        })
+    }
 }
 
 /// Metadata for the bytes a source wrote into a [`FrameSlot`].
@@ -28,6 +88,20 @@ pub struct FrameInfo {
     pub format: PixelFormat,
     pub byte_len: usize,
     pub captured_at: Instant,
+}
+
+impl FrameInfo {
+    pub fn stream_spec(self) -> Result<StreamSpec, Box<dyn std::error::Error>> {
+        let spec = StreamSpec::new(self.width, self.height, self.format)?;
+        if self.byte_len != spec.byte_len {
+            return Err(format!(
+                "frame metadata says {} bytes; {}x{} {:?} requires {}",
+                self.byte_len, spec.width, spec.height, spec.format, spec.byte_len
+            )
+            .into());
+        }
+        Ok(spec)
+    }
 }
 
 /// Reusable storage for one captured frame.
@@ -191,6 +265,10 @@ impl FramePool {
 /// storage, so a source does not allocate one `Vec` per frame. The returned
 /// metadata says exactly what the source wrote into that storage.
 pub trait FrameSource {
+    /// The fixed shape of every frame this source will produce for its current
+    /// run. A source must be recreated to change resolution or pixel format.
+    fn stream_spec(&self) -> StreamSpec;
+
     fn next_frame(&mut self, slot: &mut FrameSlot)
     -> Result<FrameInfo, Box<dyn std::error::Error>>;
 
@@ -235,6 +313,15 @@ impl FileCapture {
 }
 
 impl FrameSource for FileCapture {
+    fn stream_spec(&self) -> StreamSpec {
+        StreamSpec::new(
+            crate::config::WIDTH as u32,
+            crate::config::HEIGHT as u32,
+            PixelFormat::Yuyv422,
+        )
+        .expect("the built-in file stream spec is valid")
+    }
+
     fn next_frame(
         &mut self,
         slot: &mut FrameSlot,
@@ -295,6 +382,11 @@ mod linux {
     }
 
     impl FrameSource for V4l2Capture {
+        fn stream_spec(&self) -> StreamSpec {
+            StreamSpec::new(WIDTH as u32, HEIGHT as u32, PixelFormat::Yuyv422)
+                .expect("the built-in V4L2 stream spec is valid")
+        }
+
         fn next_frame(
             &mut self,
             slot: &mut FrameSlot,

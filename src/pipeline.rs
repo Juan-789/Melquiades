@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::capture::{FrameInfo, FramePool, FrameSource, SlotId};
-use crate::config::{FRAME_POOL_SLOTS, FRAME_SIZE};
+use crate::capture::{FrameInfo, FramePool, FrameSource, SlotId, StreamSpec};
+use crate::config::FRAME_POOL_SLOTS;
 use crate::spsc::SpscSlotRing;
 
 pub struct Pipeline {
@@ -44,8 +44,8 @@ pub struct HandoffSnapshot {
 }
 
 impl Pipeline {
-    pub fn new() -> Self {
-        let pool = Arc::new(FramePool::new(FRAME_POOL_SLOTS, FRAME_SIZE));
+    pub fn new(stream: StreamSpec) -> Self {
+        let pool = Arc::new(FramePool::new(FRAME_POOL_SLOTS, stream.byte_len));
         let free_slots = Arc::new(SpscSlotRing::new());
         let ready_slots = Arc::new(SpscSlotRing::new());
 

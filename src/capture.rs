@@ -27,19 +27,27 @@ pub struct FrameInfo {
     pub captured_at: Instant,
 }
 
-/// Reusable caller-owned storage for one captured frame.
+/// Reusable storage for one captured frame.
 ///
-/// This is deliberately one slot, not a pool. The first FramePool will own a
-/// fixed number of these slots and pass them between stages over SPSC rings.
+/// `pixels` is allocated once when the pool starts. `info` is `None` while a
+/// slot is free, and is set by the capture stage before the slot is published
+/// as ready. The SPSC rings added in the next step, rather than this type,
+/// establish which stage currently owns a slot.
 pub struct FrameSlot {
     pixels: Vec<u8>,
+    info: Option<FrameInfo>,
 }
 
 impl FrameSlot {
     pub fn new(byte_capacity: usize) -> Self {
         Self {
             pixels: vec![0; byte_capacity],
+            info: None,
         }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.pixels.len()
     }
 
     pub fn bytes_mut(&mut self, byte_len: usize) -> Result<&mut [u8], Box<dyn std::error::Error>> {
@@ -57,6 +65,91 @@ impl FrameSlot {
             )
             .into()
         })
+    }
+
+    /// Marks the slot as containing one complete captured frame.
+    ///
+    /// The capture stage must call this only after it has written all
+    /// `info.byte_len` bytes. The future ready-ring publication will make both
+    /// the bytes and this metadata visible to the sender together.
+    pub fn set_info(&mut self, info: FrameInfo) -> Result<(), Box<dyn std::error::Error>> {
+        if info.byte_len > self.capacity() {
+            return Err(format!(
+                "frame metadata describes {} bytes but slot holds {} bytes",
+                info.byte_len,
+                self.capacity()
+            )
+            .into());
+        }
+        self.info = Some(info);
+        Ok(())
+    }
+
+    pub fn info(&self) -> Option<FrameInfo> {
+        self.info
+    }
+
+    /// Clears metadata when the sender has finished with this slot and
+    /// returns its ID to the free ring.
+    pub fn clear_info(&mut self) {
+        self.info = None;
+    }
+}
+
+/// Identifies one permanent location in a [`FramePool`].
+///
+/// This is intentionally distinct from a video frame number: a slot is reused
+/// for many captured frames over the lifetime of the program.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotId(u8);
+
+impl SlotId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Fixed, preallocated storage for raw captured frames.
+///
+/// The pool owns the pixels; later SPSC rings will carry only [`SlotId`]s.
+/// A `Vec` is appropriate because slot IDs are dense, stable indexes from zero
+/// to `len - 1`. A hash map would add indirection without representing a
+/// problem this pool has.
+pub struct FramePool {
+    slots: Vec<FrameSlot>,
+}
+
+impl FramePool {
+    pub fn new(slot_count: usize, slot_byte_capacity: usize) -> Self {
+        assert!(slot_count > 0, "a frame pool needs at least one slot");
+        assert!(
+            slot_count <= u8::MAX as usize + 1,
+            "a u8 SlotId can address at most 256 slots"
+        );
+
+        let mut slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            slots.push(FrameSlot::new(slot_byte_capacity));
+        }
+
+        Self { slots }
+    }
+
+    pub fn slot(&self, id: SlotId) -> Option<&FrameSlot> {
+        self.slots.get(id.index())
+    }
+
+    pub fn slot_mut(&mut self, id: SlotId) -> Option<&mut FrameSlot> {
+        self.slots.get_mut(id.index())
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The IDs used to seed the free-slot SPSC ring at startup.
+    pub fn slot_ids(&self) -> impl Iterator<Item = SlotId> + '_ {
+        (0..self.slots.len()).map(|index| SlotId(index as u8))
     }
 }
 

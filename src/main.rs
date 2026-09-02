@@ -28,9 +28,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut capture = V4l2Capture::open("/dev/video0")?;
             streaming(&mut capture, addr)?;
         }
+        #[cfg(target_os = "linux")]
+        Some("call-cam") => {
+            let addr = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:5000".to_owned());
+            display::display_with_sender(move || {
+                let mut capture = V4l2Capture::open("/dev/video0")?;
+                streaming(&mut capture, &addr)
+            })?;
+        }
         Some("display") => display::display()?,
         _ => {
-            eprintln!("Gotta pick either [send|recv]");
+            eprintln!("pick [send|recv|display|cam|call-cam]");
             std::process::exit(1);
         }
     }

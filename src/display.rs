@@ -11,6 +11,17 @@ use crate::metrics::PipelineStats;
 use crate::transport::{ReceivedFrame, receiving};
 
 pub fn display() -> Result<(), Box<dyn std::error::Error>> {
+    display_with_sender(|| Ok(()))
+}
+
+pub fn display_with_sender(
+    sender: impl FnOnce() -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::spawn(move || {
+        if let Err(error) = sender() {
+            eprintln!("sender died: {error}");
+        }
+    });
     let (sender, receiver) = std::sync::mpsc::sync_channel::<ReceivedFrame>(1);
     std::thread::spawn(move || {
         if let Err(error) = receiving(Some(sender)) {

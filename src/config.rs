@@ -1,6 +1,8 @@
 pub const WIDTH: usize = 640;
 pub const HEIGHT: usize = 480;
 pub const FRAME_SIZE: usize = WIDTH * HEIGHT * 2; // YUYV = 2 bytes/px
+/// Raw capture slots allocated at startup. At 640x480 YUYV this is 2.34 MiB.
+pub const FRAME_POOL_SLOTS: usize = 4;
 pub const MAX_CHUNK_PAYLOAD: usize = 1200;
 pub const CHUNKS_PER_FRAME: usize = FRAME_SIZE.div_ceil(MAX_CHUNK_PAYLOAD);
 pub const HEADER_BYTES: usize = 21;

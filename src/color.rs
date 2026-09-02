@@ -11,6 +11,15 @@ pub fn yuyv_to_rgb(yuyv: &[u8], out: &mut [u32]) {
     }
 }
 
+/// Converts tightly packed BGRA bytes, as supplied by desktop capture APIs,
+/// to the `0x00RRGGBB` pixels expected by softbuffer.
+pub fn bgra_to_rgb(bgra: &[u8], out: &mut [u32]) {
+    for (pixel, rgba) in out.iter_mut().zip(bgra.chunks_exact(4)) {
+        let (b, g, r) = (rgba[0] as u32, rgba[1] as u32, rgba[2] as u32);
+        *pixel = (r << 16) | (g << 8) | b;
+    }
+}
+
 fn yuv_to_u32(y: i32, u: i32, v: i32) -> u32 {
     let c = y - 16;
     let d = u - 128;

@@ -1,15 +1,16 @@
 use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::mpsc::SyncSender;
+use std::thread;
 use std::time::Instant;
 
-use crate::capture::Capture;
+use crate::capture::{FrameSource, StreamSpec};
 use crate::compression::{compress, decompress};
 use crate::config::{
-    CHUNKS_PER_FRAME, DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, FRAME_SIZE, HEADER_BYTES,
-    MAX_CHUNK_PAYLOAD,
+    DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, HEADER_BYTES, INTER_PACKET_GAP_US, MAX_CHUNK_PAYLOAD,
 };
 use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
+use crate::pipeline::{CapturePort, Pipeline, SenderPort};
 use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
 use crate::wire::{FrameEcho, PacketHeader};
@@ -32,65 +33,135 @@ fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     }
 }
 
-pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Keep the next packet out of the kernel until the configured gap has passed.
+/// A spin wait is intentional here: `thread::sleep` is far too imprecise for a
+/// 25 microsecond experiment and would measure scheduler wake-up latency too.
+fn pace_after_send(sent_at: Instant) {
+    let next_send_at = sent_at + std::time::Duration::from_micros(INTER_PACKET_GAP_US);
+    while Instant::now() < next_send_at {
+        std::hint::spin_loop();
+    }
+}
+
+pub fn streaming<S>(source: S, addr: &str) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: FrameSource + Send + 'static,
+{
+    let stream = source.stream_spec();
+    let (capture, sender) = Pipeline::new(stream).into_ports();
+    let capture_thread = thread::Builder::new()
+        .name("melquiades-capture".into())
+        .spawn(move || {
+            if let Err(error) = capture_loop(source, &capture) {
+                capture.stop();
+                eprintln!("capture stage stopped: {error}");
+            }
+        })?;
+
+    // Sender runs on the caller's thread. It is concurrent with the dedicated
+    // capture thread above, but avoids a third coordinating thread.
+    let result = sender_loop(sender, addr, stream);
+    drop(capture_thread);
+    result
+}
+
+fn capture_loop(
+    mut source: impl FrameSource,
+    capture: &CapturePort,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        capture.capture_once(&mut source)?;
+    }
+}
+
+fn sender_loop(
+    sender: SenderPort,
+    addr: &str,
+    stream: StreamSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(addr)?;
     socket.set_nonblocking(true)?;
-    let mut frame = vec![0; FRAME_SIZE];
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut compression_stats = CompressionStats::new();
     let mut sender_stats = SenderStats::new();
     let mut frame_id = 0_u32;
 
+    eprintln!("inter-packet pacing: {INTER_PACKET_GAP_US}us (spin wait)");
+
     loop {
-        let s0_capture_begins = Instant::now();
-        capture.next_frame(&mut frame)?;
-        let s1_frame_acquired = Instant::now();
-        let capture_ts = now_nanos();
-        let s2_compression_begins = Instant::now();
-        let compressed = compress(&frame)?;
-        let s3_compression_ends = Instant::now();
-        let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
-        if total_chunks > CHUNKS_PER_FRAME {
-            eprintln!("frame {} too large: {} chunks", frame_id, total_chunks);
+        let Some(id) = sender.take_newest() else {
+            if !sender.capture_is_running() {
+                return Err("capture stage stopped".into());
+            }
+            thread::yield_now();
             continue;
-        }
-        compression_stats.record(
-            frame.len(),
-            compressed.len(),
-            total_chunks,
-            HEADER_BYTES,
-            s3_compression_ends.duration_since(s2_compression_begins),
-        );
-        let mut first_datagram_accepted = None;
-        let mut final_datagram_accepted = None;
-        for (index, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
-            let header = PacketHeader {
-                frame_id,
-                capture_ts,
-                chunk_index: index as u16,
-                total_chunks: total_chunks as u16,
-                chunk_len: chunk.len() as u16,
-                flags: FLAG_COMPRESSED,
-            };
-            header.encode(&mut datagram[..HEADER_BYTES]);
-            datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
-            send_datagram(&socket, &datagram[..HEADER_BYTES + chunk.len()])?;
-            let accepted_at = Instant::now();
-            first_datagram_accepted.get_or_insert(accepted_at);
-            final_datagram_accepted = Some(accepted_at);
-        }
-        sender_stats.record(&SenderTimings {
-            s0_capture_begins,
-            s1_frame_acquired,
-            s2_compression_begins,
-            s3_compression_ends,
-            s4_first_datagram_accepted: first_datagram_accepted
-                .expect("a compressed frame must contain at least one datagram"),
-            s5_final_datagram_accepted: final_datagram_accepted
-                .expect("a compressed frame must contain at least one datagram"),
+        };
+
+        let send_result = sender.with_frame(&id, |frame_info, frame_bytes| {
+            validate_stream_format(frame_info.stream_spec()?, stream)?;
+            let capture_ts = now_nanos();
+            let s2_compression_begins = Instant::now();
+            let compressed = compress(frame_bytes)?;
+            let s3_compression_ends = Instant::now();
+            let total_chunks = compressed.len().div_ceil(MAX_CHUNK_PAYLOAD);
+            if total_chunks > u16::MAX as usize {
+                eprintln!("frame {} too large: {} chunks", frame_id, total_chunks);
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            compression_stats.record(
+                frame_info.byte_len,
+                compressed.len(),
+                total_chunks,
+                HEADER_BYTES,
+                s3_compression_ends.duration_since(s2_compression_begins),
+            );
+            let mut first_datagram_accepted = None;
+            let mut final_datagram_accepted = None;
+            for (index, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
+                let header = PacketHeader {
+                    frame_id,
+                    capture_ts,
+                    stream,
+                    chunk_index: index as u16,
+                    total_chunks: total_chunks as u16,
+                    chunk_len: chunk.len() as u16,
+                    flags: FLAG_COMPRESSED,
+                };
+                header.encode(&mut datagram[..HEADER_BYTES]);
+                datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
+                send_datagram(&socket, &datagram[..HEADER_BYTES + chunk.len()])?;
+                let accepted_at = Instant::now();
+                first_datagram_accepted.get_or_insert(accepted_at);
+                final_datagram_accepted = Some(accepted_at);
+                if index + 1 < total_chunks {
+                    pace_after_send(accepted_at);
+                }
+            }
+            sender_stats.record(&SenderTimings {
+                s0_capture_begins: frame_info.capture_begins_at,
+                s1_frame_acquired: frame_info.captured_at,
+                s2_compression_begins,
+                s3_compression_ends,
+                s4_first_datagram_accepted: first_datagram_accepted
+                    .expect("a compressed frame must contain at least one datagram"),
+                s5_final_datagram_accepted: final_datagram_accepted
+                    .expect("a compressed frame must contain at least one datagram"),
+            });
+            Ok::<(), Box<dyn std::error::Error>>(())
         });
+        sender.return_to_free(id);
+        send_result?;
+
+        if frame_id % 300 == 299 {
+            let handoff = sender.take_snapshot();
+            eprintln!(
+                "capture-to-sender handoff over 300 sent frames: capture_no_free_drops={} sender_stale_drops={}",
+                handoff.capture_dropped_no_free_slot, handoff.sender_dropped_stale_ready,
+            );
+        }
+
         while let Ok(received) = socket.recv(&mut echo_bytes) {
             // Drain receipts so they do not accumulate. Cross-machine and delayed-read
             // timing is intentionally not reported as one-way latency.
@@ -100,8 +171,24 @@ pub fn streaming(capture: &mut impl Capture, addr: &str) -> Result<(), Box<dyn s
     }
 }
 
+/// The source declares one format for a run. Catch a backend accidentally
+/// changing its capture shape before it can corrupt the fixed pool layout.
+fn validate_stream_format(
+    frame: StreamSpec,
+    configured: StreamSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if frame != configured {
+        return Err(format!(
+            "source changed stream shape from {configured:?} to {frame:?}; recreate the pipeline for a new resolution"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub struct ReceivedFrame {
     pub pixels: Vec<u8>,
+    pub stream: StreamSpec,
     pub timings: FrameTimings,
 }
 
@@ -111,7 +198,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
     let mut reassembler = Reassembler::new();
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    let mut decompressed = Vec::with_capacity(FRAME_SIZE);
+    let mut decompressed = Vec::new();
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut reassembly_stats = ReassemblyStats::new();
 
@@ -138,7 +225,13 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                     reassembler.total_chunks
                 );
             }
-            reassembler.reset(header.frame_id);
+            if !reassembler.reset(&header) {
+                eprintln!(
+                    "refused frame {}: {} chunks exceed the reassembly safety limit",
+                    header.frame_id, header.total_chunks
+                );
+                continue;
+            }
         }
         let payload_end = HEADER_BYTES + header.chunk_len as usize;
         if payload_end > received {
@@ -170,11 +263,12 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
             .min(u32::MAX as u128) as u32;
         match result {
             Ok(()) => {
-                if decompressed.len() != FRAME_SIZE {
+                if decompressed.len() != header.stream.byte_len {
                     eprintln!(
-                        "frame {} wrong size: {}",
+                        "frame {} wrong size: {}, expected {}",
                         header.frame_id,
-                        decompressed.len()
+                        decompressed.len(),
+                        header.stream.byte_len,
                     );
                     continue;
                 }
@@ -190,6 +284,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                     Some(tx) => {
                         let frame = ReceivedFrame {
                             pixels: decompressed.clone(),
+                            stream: header.stream,
                             timings: FrameTimings {
                                 t0_compressed_frame_complete,
                                 t1_decode_begins,

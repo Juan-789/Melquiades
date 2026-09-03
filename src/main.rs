@@ -11,6 +11,9 @@ mod time;
 mod transport;
 mod wire;
 
+#[cfg(target_os = "linux")]
+mod screen;
+
 use capture::FileCapture;
 #[cfg(target_os = "linux")]
 use capture::V4l2Capture;
@@ -24,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             streaming(capture, "0.0.0.0")?;
         }
         Some("recv") => receiving(None)?,
+        #[cfg(target_os = "linux")]
+        Some("cast") => screen::ShareScreen::full_monitor().run()?,
         #[cfg(target_os = "linux")]
         Some("cam") => {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1");
@@ -43,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("display") => display::display()?,
         _ => {
-            eprintln!("pick [send|recv|display|cam|call-cam]");
+            eprintln!("pick [send|recv|display|cam|call-cam|cast]");
             std::process::exit(1);
         }
     }

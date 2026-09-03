@@ -356,7 +356,7 @@ mod linux {
 
     use std::time::Instant;
 
-    use super::{FrameInfo, FrameSlot, FrameSource, PixelFormat};
+    use super::{FrameInfo, FrameSlot, FrameSource, PixelFormat, StreamSpec};
     use crate::config::{FRAME_SIZE, HEIGHT, WIDTH};
 
     pub struct V4l2Capture {

@@ -68,11 +68,13 @@ impl ShareScreen {
         }
 
         let session = portal.create_session(Default::default()).await?;
+
+        let requested_sources = self.source_type | self.source_type; 
         portal
             .select_sources(
                 &session,
                 SelectSourcesOptions::default()
-                    .set_sources(self.source_type)
+                    .set_sources(requested_sources)
                     .set_multiple(false)
                     .set_cursor_mode(self.cursor_mode)
                     .set_persist_mode(PersistMode::DoNot),

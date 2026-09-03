@@ -16,6 +16,7 @@ pub struct Pipeline {
     sender: SenderPort,
 }
 
+#[derive(Clone)]
 pub struct CapturePort {
     pool: Arc<FramePool>,
     free_slots: Arc<SpscSlotRing>,
@@ -24,6 +25,7 @@ pub struct CapturePort {
     capture_running: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 pub struct SenderPort {
     pool: Arc<FramePool>,
     free_slots: Arc<SpscSlotRing>,
@@ -41,6 +43,16 @@ struct HandoffCounters {
 pub struct HandoffSnapshot {
     pub capture_dropped_no_free_slot: u64,
     pub sender_dropped_stale_ready: u64,
+}
+
+/// Result of offering one completed source frame to the capture side of the
+/// pool. Dropping at this boundary is intentional: it is always better to
+/// discard a newly-arrived frame than to make a live pipeline show an older
+/// one later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapturePublish {
+    Published,
+    DroppedNoFreeSlot,
 }
 
 impl Pipeline {
@@ -127,6 +139,79 @@ impl CapturePort {
             panic!("ReadySlots full after capture claimed {id:?}");
         }
         Ok(())
+    }
+
+    /// Copies one externally-owned, possibly strided image into a free slot
+    /// and publishes the slot ID to `ReadySlots`.
+    ///
+    /// PipeWire owns its buffers and reclaims them as soon as its process
+    /// callback returns. A screen source therefore cannot hand their pointers
+    /// through our pool. This is the one required copy: row-by-row packing
+    /// makes every downstream stage see a tight `width * bytes_per_pixel`
+    /// layout, regardless of the source stride.
+    ///
+    /// The method never waits. If sender owns every slot, the just-arrived
+    /// source frame is dropped and the source callback can return its buffer
+    /// to the OS immediately.
+    pub fn publish_strided(
+        &self,
+        mut info: FrameInfo,
+        source: &[u8],
+        source_stride: usize,
+    ) -> Result<CapturePublish, Box<dyn std::error::Error>> {
+        let stream = info.stream_spec()?;
+        let row_bytes = (stream.width as usize)
+            .checked_mul(stream.format.bytes_per_pixel())
+            .ok_or("screen row byte length overflow")?;
+        if source_stride < row_bytes {
+            return Err(format!(
+                "source stride {source_stride} is smaller than one {row_bytes}-byte image row"
+            )
+            .into());
+        }
+        let needed = source_stride
+            .checked_mul(stream.height.saturating_sub(1) as usize)
+            .and_then(|before_last| before_last.checked_add(row_bytes))
+            .ok_or("strided source byte length overflow")?;
+        if source.len() < needed {
+            return Err(format!(
+                "source contains {} bytes; {stream:?} with stride {source_stride} needs {needed}",
+                source.len()
+            )
+            .into());
+        }
+
+        let Some(id) = self.free_slots.try_pop() else {
+            self.counters
+                .capture_dropped_no_free_slot
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(CapturePublish::DroppedNoFreeSlot);
+        };
+
+        unsafe {
+            // SAFETY: removing this ID from FreeSlots gives this capture
+            // producer exclusive access until ReadySlots publishes it below.
+            let slot = self.pool.capture_slot(&id);
+            let destination = slot.bytes_mut(info.byte_len)?;
+            for row in 0..stream.height as usize {
+                let source_start = row * source_stride;
+                let destination_start = row * row_bytes;
+                destination[destination_start..destination_start + row_bytes]
+                    .copy_from_slice(&source[source_start..source_start + row_bytes]);
+            }
+            // The frame becomes ours only after the final source row reached
+            // the pool. This timestamp makes C0→C1 include that required copy.
+            info.captured_at = std::time::Instant::now();
+            slot.set_info(info)?;
+        }
+
+        if let Err(id) = self.ready_slots.try_push(id) {
+            // The slot-conservation invariant makes this impossible: removing
+            // one ID from FreeSlots means ReadySlots cannot still hold all IDs.
+            // Returning it to FreeSlots here would create a second producer.
+            panic!("ReadySlots full after capture claimed {id:?}");
+        }
+        Ok(CapturePublish::Published)
     }
 }
 

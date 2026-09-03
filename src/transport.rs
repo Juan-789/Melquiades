@@ -60,9 +60,23 @@ where
 
     // Sender runs on the caller's thread. It is concurrent with the dedicated
     // capture thread above, but avoids a third coordinating thread.
-    let result = sender_loop(sender, addr, stream);
+    let result = stream_from_sender(sender, addr, stream);
     drop(capture_thread);
     result
+}
+
+/// Runs the sender half of a pipeline whose capture half is driven by an
+/// asynchronous source such as a PipeWire process callback.
+///
+/// Unlike [`streaming`], this function does not create a capture thread. The
+/// caller owns that independently-running producer and must have constructed
+/// both ports from the same [`Pipeline`].
+pub fn stream_from_sender(
+    sender: SenderPort,
+    addr: &str,
+    stream: StreamSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sender_loop(sender, addr, stream)
 }
 
 fn capture_loop(

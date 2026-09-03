@@ -11,3 +11,7 @@ winit = "0.29"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linuxvideo = "0.3.5"
+pipewire = "0.10.1"
+zbus = "5.19.0"
+ashpd = { version = "0.13.13", features = ["screencast"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

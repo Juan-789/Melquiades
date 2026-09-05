@@ -11,7 +11,7 @@ mod time;
 mod transport;
 mod wire;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod screen;
 
 use capture::FileCapture;
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             streaming(capture, "0.0.0.0")?;
         }
         Some("recv") => receiving(None)?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some("cast") => {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:5000");
             screen::ShareScreen::full_monitor().run(addr)?

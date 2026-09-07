@@ -7,13 +7,14 @@ use std::time::Instant;
 use crate::capture::{FrameSource, StreamSpec};
 use crate::compression::{compress, decompress};
 use crate::config::{
-    DATAGRAM_MAX, ECHO_BYTES, FLAG_COMPRESSED, HEADER_BYTES, INTER_PACKET_GAP_US, MAX_CHUNK_PAYLOAD,
+    DATAGRAM_MAX, ECHO_BYTES, INTER_PACKET_GAP_US, LEGACY_FLAG_COMPRESSED, LEGACY_RAW_HEADER_BYTES,
+    MAX_CHUNK_PAYLOAD,
 };
 use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
 use crate::pipeline::{CapturePort, Pipeline, SenderPort};
 use crate::reassembly::Reassembler;
 use crate::time::now_nanos;
-use crate::wire::{FrameEcho, PacketHeader};
+use crate::wire::{FrameEcho, LegacyRawPacketHeader};
 
 fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     loop {
@@ -128,24 +129,25 @@ fn sender_loop(
                 frame_info.byte_len,
                 compressed.len(),
                 total_chunks,
-                HEADER_BYTES,
+                LEGACY_RAW_HEADER_BYTES,
                 s3_compression_ends.duration_since(s2_compression_begins),
             );
             let mut first_datagram_accepted = None;
             let mut final_datagram_accepted = None;
             for (index, chunk) in compressed.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
-                let header = PacketHeader {
+                let header = LegacyRawPacketHeader {
                     frame_id,
                     capture_ts,
                     stream,
                     chunk_index: index as u16,
                     total_chunks: total_chunks as u16,
                     chunk_len: chunk.len() as u16,
-                    flags: FLAG_COMPRESSED,
+                    flags: LEGACY_FLAG_COMPRESSED,
                 };
-                header.encode(&mut datagram[..HEADER_BYTES]);
-                datagram[HEADER_BYTES..HEADER_BYTES + chunk.len()].copy_from_slice(chunk);
-                send_datagram(&socket, &datagram[..HEADER_BYTES + chunk.len()])?;
+                header.encode(&mut datagram[..LEGACY_RAW_HEADER_BYTES]);
+                datagram[LEGACY_RAW_HEADER_BYTES..LEGACY_RAW_HEADER_BYTES + chunk.len()]
+                    .copy_from_slice(chunk);
+                send_datagram(&socket, &datagram[..LEGACY_RAW_HEADER_BYTES + chunk.len()])?;
                 let accepted_at = Instant::now();
                 first_datagram_accepted.get_or_insert(accepted_at);
                 final_datagram_accepted = Some(accepted_at);
@@ -218,7 +220,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
 
     loop {
         let (received, source) = socket.recv_from(&mut datagram)?;
-        let header = match PacketHeader::decode(&datagram[..received]) {
+        let header = match LegacyRawPacketHeader::decode(&datagram[..received]) {
             Some(header) => header,
             None => {
                 eprintln!("malformed packet: {} bytes", received);
@@ -247,7 +249,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                 continue;
             }
         }
-        let payload_end = HEADER_BYTES + header.chunk_len as usize;
+        let payload_end = LEGACY_RAW_HEADER_BYTES + header.chunk_len as usize;
         if payload_end > received {
             eprintln!(
                 "truncated packet: claims {} bytes, got {}",
@@ -255,7 +257,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
             );
             continue;
         }
-        if !reassembler.add(&header, &datagram[HEADER_BYTES..payload_end]) {
+        if !reassembler.add(&header, &datagram[LEGACY_RAW_HEADER_BYTES..payload_end]) {
             continue;
         }
 
@@ -271,7 +273,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
         let t1_decode_begins = Instant::now();
         let result = decompress(&reassembler.buf[..reassembler.bytes], &mut decompressed);
         let t2_decode_ends = Instant::now();
-        let decompress_us = t2_decode_ends
+        let decode_us = t2_decode_ends
             .duration_since(t1_decode_begins)
             .as_micros()
             .min(u32::MAX as u128) as u32;
@@ -290,7 +292,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                     frame_id: header.frame_id,
                     capture_ts: header.capture_ts,
                     spread_us,
-                    decompress_us,
+                    decode_us,
                 }
                 .encode(&mut echo_bytes);
                 let _ = socket.send_to(&echo_bytes, source);

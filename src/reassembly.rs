@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::capture::StreamSpec;
 use crate::config::{MAX_CHUNK_PAYLOAD, MAX_COMPRESSED_FRAME_BYTES};
-use crate::wire::PacketHeader;
+use crate::wire::LegacyRawPacketHeader;
 
 /// One in-progress compressed frame. Storage grows only when a newly accepted
 /// stream needs more space; normal frames reuse both this byte buffer and the
@@ -34,7 +34,7 @@ impl Reassembler {
 
     /// Starts assembling `header`'s frame. `false` means its claimed packet
     /// count would exceed the receiver's explicit memory safety limit.
-    pub fn reset(&mut self, header: &PacketHeader) -> bool {
+    pub fn reset(&mut self, header: &LegacyRawPacketHeader) -> bool {
         let total_chunks = header.total_chunks as usize;
         let compressed_capacity = match total_chunks.checked_mul(MAX_CHUNK_PAYLOAD) {
             Some(bytes) if total_chunks > 0 && bytes <= MAX_COMPRESSED_FRAME_BYTES => bytes,
@@ -55,7 +55,7 @@ impl Reassembler {
         true
     }
 
-    pub fn add(&mut self, header: &PacketHeader, payload: &[u8]) -> bool {
+    pub fn add(&mut self, header: &LegacyRawPacketHeader, payload: &[u8]) -> bool {
         let index = header.chunk_index as usize;
         if self.stream != Some(header.stream)
             || header.total_chunks != self.total_chunks

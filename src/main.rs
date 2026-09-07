@@ -1,4 +1,5 @@
 mod capture;
+mod codec;
 mod color;
 mod compression;
 mod config;

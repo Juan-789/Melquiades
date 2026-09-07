@@ -5,6 +5,8 @@ use std::thread;
 use std::time::Instant;
 
 use crate::capture::{FrameSource, StreamSpec};
+#[cfg(target_os = "linux")]
+use crate::codec::linux::LinuxH264Decoder;
 use crate::codec::{Codec, EncodedFrame};
 use crate::compression::{compress, decompress};
 use crate::config::{
@@ -15,7 +17,9 @@ use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStat
 use crate::pipeline::{CapturePort, Pipeline, SenderPort};
 use crate::reassembly::{H264Reassembler, Reassembler};
 use crate::time::now_nanos;
-use crate::wire::{FLAG_KEYFRAME, FrameEcho, LegacyRawPacketHeader, PacketHeader};
+use crate::wire::{
+    FLAG_KEYFRAME, FLAG_PARAMETER_SETS, FrameEcho, LegacyRawPacketHeader, PacketHeader,
+};
 
 fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     loop {
@@ -89,7 +93,13 @@ impl H264UdpSender {
             ));
         }
 
-        let flags = if frame.is_keyframe { FLAG_KEYFRAME } else { 0 };
+        let mut flags = 0;
+        if frame.is_keyframe {
+            flags |= FLAG_KEYFRAME;
+        }
+        if frame.has_parameter_sets {
+            flags |= FLAG_PARAMETER_SETS;
+        }
         for (index, payload) in frame.bytes.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
             let header = PacketHeader {
                 flags,
@@ -448,5 +458,111 @@ pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
             reassembler.flags & FLAG_KEYFRAME != 0,
             spread_us,
         );
+    }
+}
+
+/// Linux receiver path that turns completed H.264 access units into display
+/// frames. This stays separate from `receiving_h264()` so the latter remains
+/// a quiet, decoder-independent packetization diagnostic.
+#[cfg(target_os = "linux")]
+pub fn receiving_h264_to_display(
+    tx: SyncSender<ReceivedFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    let mut datagram = vec![0; DATAGRAM_MAX];
+    let mut reassembler = H264Reassembler::new();
+    let mut decoder = LinuxH264Decoder::new()?;
+    // Joining a live stream in the middle of a GOP, or losing any fragment,
+    // means P-frames no longer have a reliable reference picture. Refuse them
+    // until an IDR that carries SPS/PPS repairs decoder state.
+    let mut waiting_for_recovery_keyframe = true;
+    let mut skipped_while_waiting = 0_u64;
+
+    eprintln!("waiting for decoder-ready JUAN H.264 on UDP port 5000");
+    loop {
+        let (received, _) = socket.recv_from(&mut datagram)?;
+        let Some((header, payload)) = PacketHeader::split_datagram(&datagram[..received]) else {
+            eprintln!("malformed H.264 packet: {received} bytes");
+            continue;
+        };
+
+        if header.frame_id != reassembler.frame_id {
+            if !reassembler.is_newer_frame(header.frame_id) {
+                continue;
+            }
+            if reassembler.total_chunks > 0 && reassembler.missing() > 0 {
+                eprintln!(
+                    "H.264 frame {} lost: {} of {} packets missing; waiting for a recovery keyframe",
+                    reassembler.frame_id,
+                    reassembler.missing(),
+                    reassembler.total_chunks,
+                );
+                waiting_for_recovery_keyframe = true;
+            }
+            if !reassembler.reset(&header) {
+                eprintln!(
+                    "refused H.264 frame {}: {} packets exceed the safety limit",
+                    header.frame_id, header.total_chunks
+                );
+                waiting_for_recovery_keyframe = true;
+                continue;
+            }
+        }
+        if !reassembler.add(&header, payload) {
+            continue;
+        }
+
+        let is_keyframe = reassembler.flags & FLAG_KEYFRAME != 0;
+        let has_parameter_sets = reassembler.flags & FLAG_PARAMETER_SETS != 0;
+        if waiting_for_recovery_keyframe {
+            if !is_keyframe || !has_parameter_sets {
+                skipped_while_waiting += 1;
+                continue;
+            }
+            // A fresh decoder guarantees an IDR after loss cannot retain a
+            // damaged reference picture from the previous GOP.
+            decoder = LinuxH264Decoder::new()?;
+            waiting_for_recovery_keyframe = false;
+            eprintln!(
+                "H.264 recovery at keyframe {} after skipping {skipped_while_waiting} access units",
+                reassembler.frame_id
+            );
+            skipped_while_waiting = 0;
+        }
+
+        let t0_complete = Instant::now();
+        let t1_decode_begins = Instant::now();
+        let decoded = decoder.decode_access_unit(&reassembler.buf[..reassembler.bytes]);
+        let t2_decode_ends = Instant::now();
+        match decoded {
+            Ok(Some(frame)) => {
+                let _ = tx.try_send(ReceivedFrame {
+                    pixels: frame.pixels,
+                    stream: frame.stream,
+                    timings: FrameTimings {
+                        t0_compressed_frame_complete: t0_complete,
+                        t1_decode_begins,
+                        t2_decode_ends,
+                    },
+                });
+            }
+            Ok(None) => {
+                // Normally only occurs before the first complete IDR. If it
+                // happens after one, conservatively wait for the next repair
+                // point rather than presenting an older image indefinitely.
+                waiting_for_recovery_keyframe = true;
+                eprintln!(
+                    "H.264 decoder produced no picture for frame {}; waiting for a keyframe",
+                    reassembler.frame_id
+                );
+            }
+            Err(error) => {
+                waiting_for_recovery_keyframe = true;
+                eprintln!(
+                    "H.264 decode failed for frame {}: {error}; waiting for a keyframe",
+                    reassembler.frame_id
+                );
+            }
+        }
     }
 }

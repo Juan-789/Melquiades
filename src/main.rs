@@ -58,10 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 streaming(capture, &addr)
             })?;
         }
+        #[cfg(target_os = "linux")]
+        Some("h264-display") => display::display_h264()?,
         Some("display") => display::display()?,
         _ => {
             eprintln!(
-                "pick [send|recv|h264-recv|display|cam|call-cam|cast [receiver:port]|h264-smoke|cast-h264 [receiver:port]]"
+                "pick [send|recv|h264-recv|h264-display|display|cam|call-cam|cast [receiver:port]|h264-smoke|cast-h264 [receiver:port]]"
             );
             std::process::exit(1);
         }

@@ -17,6 +17,9 @@ pub const HEADER_BYTES: usize = 14;
 
 /// The encoded frame is independently decodable (an H.264 IDR/keyframe).
 pub const FLAG_KEYFRAME: u8 = 0b0000_0001;
+/// The access unit contains the H.264 sequence and picture parameter sets
+/// required by a decoder to initialize or recover at this keyframe.
+pub const FLAG_PARAMETER_SETS: u8 = 0b0000_0010;
 
 /// H.264 access-unit fragment metadata repeated on every UDP datagram.
 ///

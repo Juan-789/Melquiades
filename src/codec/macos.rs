@@ -16,11 +16,15 @@ use std::{
 };
 
 use apple_cf::iosurface::IOSurface;
+use apple_cf::raw::CMVideoFormatDescriptionGetH264ParameterSetAtIndex;
 use screencapturekit::prelude::{
     CMSampleBuffer, CMSampleBufferExt, PixelFormat as ScreenPixelFormat, SCContentFilter,
     SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
 };
-use videotoolbox::prelude::{Codec as VideoToolboxCodec, CompressionSession};
+use videotoolbox::{
+    compression::EncodedFrame as VideoToolboxEncodedFrame,
+    prelude::{Codec as VideoToolboxCodec, CompressionSession, ProfileLevel},
+};
 
 use crate::{
     capture::{PixelFormat, StreamSpec},
@@ -40,6 +44,11 @@ pub struct MacH264Encoder {
     frames_per_second: i32,
     session: CompressionSession,
     next_pts: i64,
+    /// VideoToolbox stores SPS/PPS in `CMFormatDescription`, rather than in
+    /// the AVCC access-unit bytes it returns. They do not change for one
+    /// fixed session, so retaining them once avoids querying CoreMedia for
+    /// every frame and lets every IDR be independently decodable on the wire.
+    parameter_sets: Option<Vec<Vec<u8>>>,
 }
 
 impl MacH264Encoder {
@@ -62,6 +71,12 @@ impl MacH264Encoder {
         let session = CompressionSession::builder(width, height, VideoToolboxCodec::H264)
             .with_real_time(true)
             .with_allow_frame_reordering(false)
+            // OpenH264 is deliberately conservative about decoder features.
+            // Requesting constrained baseline avoids VideoToolbox selecting a
+            // more advanced profile that the Linux baseline decoder may not
+            // accept, while AutoLevel still selects the needed H.264 level
+            // for this resolution and frame rate.
+            .with_profile_level(ProfileLevel::H264ConstrainedBaselineAutoLevel)
             .with_average_bit_rate(average_bit_rate)
             .with_expected_frame_rate(frames_per_second as f64)
             .with_max_keyframe_interval(keyframe_interval)
@@ -72,6 +87,7 @@ impl MacH264Encoder {
             frames_per_second,
             session,
             next_pts: 0,
+            parameter_sets: None,
         })
     }
 
@@ -109,7 +125,17 @@ impl MacH264Encoder {
         if output.data.is_empty() {
             return Err("VideoToolbox returned an empty H.264 access unit".into());
         }
-        let (is_keyframe, has_parameter_sets) = inspect_length_prefixed_h264(&output.data);
+        let (is_keyframe, source_has_parameter_sets) = inspect_length_prefixed_h264(&output.data);
+        if self.parameter_sets.is_none() {
+            self.parameter_sets = Some(parameter_sets_from_video_toolbox(&output)?);
+        }
+        let parameter_sets = if is_keyframe && !source_has_parameter_sets {
+            self.parameter_sets.as_deref().unwrap_or_default()
+        } else {
+            &[]
+        };
+        let bytes = avcc_access_unit_to_annex_b(&output.data, parameter_sets)?;
+        let has_parameter_sets = source_has_parameter_sets || !parameter_sets.is_empty();
 
         Ok(EncodedFrame {
             frame_id,
@@ -117,13 +143,121 @@ impl MacH264Encoder {
             source_pts_us,
             is_keyframe,
             has_parameter_sets,
-            bytes: output.data,
+            bytes,
         })
     }
 }
 
-/// Parses AVCC length-prefixed NAL units only for metadata. The bytes remain
-/// untouched; packetization will carry the entire access unit.
+/// Copies the SPS/PPS NAL units out of VideoToolbox's format description.
+///
+/// Apple owns the pointers returned by CoreMedia. We copy their contents while
+/// the encoded sample buffer and its format description are retained, then
+/// cache the owned vectors in `MacH264Encoder` for this fixed stream session.
+fn parameter_sets_from_video_toolbox(
+    output: &VideoToolboxEncodedFrame,
+) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let sample = output
+        .cm_sample_buffer()
+        .ok_or("VideoToolbox output had no CoreMedia sample buffer")?;
+    let description = sample
+        .format_description()
+        .ok_or("VideoToolbox output had no H.264 format description")?;
+    if !description.is_h264() {
+        return Err("VideoToolbox output format description was not H.264".into());
+    }
+
+    let mut sets = Vec::new();
+    let mut count = 0_usize;
+    let mut nal_header_length = 0_i32;
+    for index in 0.. {
+        let mut pointer = std::ptr::null();
+        let mut byte_len = 0_usize;
+        let status = unsafe {
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                description.as_ptr().cast(),
+                index,
+                &mut pointer,
+                &mut byte_len,
+                &mut count,
+                &mut nal_header_length,
+            )
+        };
+        if status != 0 {
+            if index == 0 {
+                return Err(format!(
+                    "CoreMedia could not read H.264 parameter set 0 (status {status})"
+                )
+                .into());
+            }
+            break;
+        }
+        if pointer.is_null() || byte_len == 0 {
+            return Err("CoreMedia returned an empty H.264 parameter set".into());
+        }
+        // SAFETY: CoreMedia owns `pointer` for as long as `description` is
+        // retained above; we immediately copy exactly its reported byte span.
+        sets.push(unsafe { std::slice::from_raw_parts(pointer, byte_len) }.to_vec());
+        if index + 1 >= count {
+            break;
+        }
+    }
+    if sets.len() < 2 || nal_header_length != 4 {
+        return Err(format!(
+            "expected H.264 SPS/PPS with 4-byte AVCC lengths; got {} sets and {nal_header_length}-byte lengths",
+            sets.len()
+        )
+        .into());
+    }
+    Ok(sets)
+}
+
+/// Converts VideoToolbox's AVCC length-prefixed NAL units into Annex B start
+/// code units, the elementary-stream form OpenH264 accepts on Linux.
+///
+/// `parameter_sets` are copied before the first IDR when VideoToolbox kept
+/// them solely in its format description. Their NAL headers are included in
+/// each slice; this function adds only Annex B's `00 00 00 01` delimiter.
+fn avcc_access_unit_to_annex_b(
+    avcc: &[u8],
+    parameter_sets: &[Vec<u8>],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut annex_b = Vec::with_capacity(avcc.len() + parameter_sets.len() * 32);
+    for set in parameter_sets {
+        if set.is_empty() {
+            return Err("cached H.264 parameter set was empty".into());
+        }
+        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+        annex_b.extend_from_slice(set);
+    }
+
+    let mut cursor = 0_usize;
+    while cursor < avcc.len() {
+        let length_end = cursor
+            .checked_add(4)
+            .ok_or("H.264 AVCC length offset overflow")?;
+        if length_end > avcc.len() {
+            return Err("truncated H.264 AVCC NAL length".into());
+        }
+        let nal_len = u32::from_be_bytes(avcc[cursor..length_end].try_into()?) as usize;
+        cursor = length_end;
+        let nal_end = cursor
+            .checked_add(nal_len)
+            .ok_or("H.264 AVCC NAL length overflow")?;
+        if nal_len == 0 || nal_end > avcc.len() {
+            return Err("invalid H.264 AVCC NAL length".into());
+        }
+        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+        annex_b.extend_from_slice(&avcc[cursor..nal_end]);
+        cursor = nal_end;
+    }
+    if annex_b.is_empty() {
+        return Err("H.264 Annex B access unit was empty".into());
+    }
+    Ok(annex_b)
+}
+
+/// Parses VideoToolbox's AVCC length-prefixed NAL units for metadata before
+/// `avcc_access_unit_to_annex_b` converts the access unit for transmission.
 fn inspect_length_prefixed_h264(bytes: &[u8]) -> (bool, bool) {
     let mut cursor: usize = 0;
     let mut is_keyframe = false;
@@ -406,7 +540,7 @@ pub fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_length_prefixed_h264;
+    use super::{avcc_access_unit_to_annex_b, inspect_length_prefixed_h264};
 
     #[test]
     fn identifies_idr_and_parameter_sets_in_avcc() {
@@ -416,5 +550,24 @@ mod tests {
             0, 0, 0, 1, 0x65, // IDR
         ];
         assert_eq!(inspect_length_prefixed_h264(&bytes), (true, true));
+    }
+
+    #[test]
+    fn converts_avcc_and_prepends_cached_parameter_sets() {
+        let avcc = [
+            0, 0, 0, 2, 0x65, 0x88, // IDR NAL
+            0, 0, 0, 2, 0x41, 0x99, // non-IDR slice NAL
+        ];
+        let parameter_sets = vec![vec![0x67, 0x42], vec![0x68, 0xCE]];
+        let annex_b = avcc_access_unit_to_annex_b(&avcc, &parameter_sets).unwrap();
+        assert_eq!(
+            annex_b,
+            [
+                0, 0, 0, 1, 0x67, 0x42, // SPS
+                0, 0, 0, 1, 0x68, 0xCE, // PPS
+                0, 0, 0, 1, 0x65, 0x88, // IDR
+                0, 0, 0, 1, 0x41, 0x99, // slice
+            ]
+        );
     }
 }

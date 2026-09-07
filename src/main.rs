@@ -33,6 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:5000");
             screen::ShareScreen::full_monitor().run(addr)?
         }
+        #[cfg(target_os = "macos")]
+        Some("h264-smoke") => codec::macos::run_h264_smoke()?,
         #[cfg(target_os = "linux")]
         Some("cam") => {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1");
@@ -52,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("display") => display::display()?,
         _ => {
-            eprintln!("pick [send|recv|display|cam|call-cam|cast [receiver:port]]");
+            eprintln!("pick [send|recv|display|cam|call-cam|cast [receiver:port]|h264-smoke]");
             std::process::exit(1);
         }
     }

@@ -16,3 +16,6 @@ pub struct EncodedFrame {
     pub has_parameter_sets: bool,
     pub bytes: Vec<u8>, // one complete H.264 access unit
 }
+
+#[cfg(target_os = "macos")]
+pub mod macos;

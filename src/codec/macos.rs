@@ -7,9 +7,11 @@
 use std::{
     error::Error,
     sync::{
-        Mutex,
-        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{SyncSender, TrySendError, sync_channel},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -23,6 +25,7 @@ use videotoolbox::prelude::{Codec as VideoToolboxCodec, CompressionSession};
 use crate::{
     capture::{PixelFormat, StreamSpec},
     codec::{Codec, EncodedFrame},
+    transport::H264UdpSender,
 };
 
 const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
@@ -159,6 +162,72 @@ struct H264SmokeHandler {
     frames_encoded: AtomicU32,
 }
 
+/// ScreenCaptureKit's callback-side half of the network H.264 pipeline.
+///
+/// The callback keeps the source IOSurface and the encoder together, because
+/// VideoToolbox consumes that IOSurface synchronously. It then moves the
+/// resulting encoded `Vec<u8>` into a bounded queue. The UDP thread owns the
+/// socket, so a slow socket never makes the capture callback wait. A full
+/// queue deliberately drops the newly encoded frame: real-time video should
+/// prefer the most recent image over growing latency.
+struct H264CastHandler {
+    encoder: Mutex<MacH264Encoder>,
+    outbound: SyncSender<EncodedFrame>,
+    sender_alive: Arc<AtomicBool>,
+    started_at: Instant,
+    next_frame_id: AtomicU32,
+    encoded: AtomicU32,
+    dropped_before_send: AtomicU32,
+}
+
+impl SCStreamOutputTrait for H264CastHandler {
+    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+        if of_type != SCStreamOutputType::Screen || !self.sender_alive.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(pixel_buffer) = sample.image_buffer() else {
+            return;
+        };
+        let Some(surface) = pixel_buffer.io_surface() else {
+            eprintln!("ScreenCaptureKit frame was not IOSurface-backed");
+            return;
+        };
+
+        let frame_id = self.next_frame_id.fetch_add(1, Ordering::Relaxed);
+        let source_pts_us = self.started_at.elapsed().as_micros() as u64;
+        let frame = match self.encoder.lock() {
+            Ok(mut encoder) => encoder.encode_surface(frame_id, source_pts_us, &surface),
+            Err(_) => Err("H.264 encoder mutex poisoned".into()),
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("H.264 encode failed: {error}");
+                return;
+            }
+        };
+
+        match self.outbound.try_send(frame) {
+            Ok(()) => {
+                let encoded = self.encoded.fetch_add(1, Ordering::Relaxed) + 1;
+                if encoded.is_multiple_of(300) {
+                    eprintln!(
+                        "H.264 capture: encoded={encoded}, dropped_before_send={}",
+                        self.dropped_before_send.load(Ordering::Relaxed)
+                    );
+                }
+            }
+            Err(TrySendError::Full(_)) => {
+                self.dropped_before_send.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.sender_alive.store(false, Ordering::Release);
+                eprintln!("H.264 sender thread stopped; capture will stop encoding frames");
+            }
+        }
+    }
+}
+
 impl SCStreamOutputTrait for H264SmokeHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
         if of_type != SCStreamOutputType::Screen {
@@ -234,6 +303,104 @@ pub fn run_h264_smoke() -> Result<(), Box<dyn Error>> {
     std::thread::sleep(Duration::from_secs(2));
     eprintln!("h264 smoke: stopping stream");
     capture.stop_capture()?;
+    Ok(())
+}
+
+/// Captures a macOS display, encodes it as H.264, and sends access units over
+/// UDP using the JUAN v1 packet header.
+///
+/// The matching receiver is `Melquiades h264-recv` on the Linux host. It
+/// currently proves packet reassembly only; displaying the stream is the next
+/// milestone, after the Linux decoder and SPS/PPS handoff are added.
+pub fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
+    const WIDTH: u32 = 1920;
+    const HEIGHT: u32 = 1080;
+    const FPS: i32 = 30;
+    const BIT_RATE: i32 = 8_000_000;
+    const KEYFRAME_INTERVAL: i32 = 30;
+
+    let stream_spec = StreamSpec::new(WIDTH, HEIGHT, PixelFormat::Bgra8888)?;
+    eprintln!("h264 cast: querying shareable displays");
+    let content = SCShareableContent::get()?;
+    let displays = content.displays();
+    let display = displays.first().ok_or("no display was available")?;
+    let filter = SCContentFilter::create()
+        .with_display(display)
+        .with_excluding_windows(&[])
+        .build();
+    let config = SCStreamConfiguration::new()
+        .with_width(WIDTH)
+        .with_height(HEIGHT)
+        .with_pixel_format(ScreenPixelFormat::BGRA)
+        .with_fps(FPS as u32);
+
+    eprintln!(
+        "h264 cast: creating {WIDTH}x{HEIGHT} {FPS}fps VideoToolbox encoder at {} Mbps",
+        BIT_RATE / 1_000_000
+    );
+    let encoder = MacH264Encoder::new(stream_spec, FPS, BIT_RATE, KEYFRAME_INTERVAL)?;
+
+    // Two encoded access units gives the socket thread a little scheduling
+    // room while bounding the latency that can accumulate behind it.
+    let (outbound, encoded_frames) = sync_channel::<EncodedFrame>(2);
+    let sender_alive = Arc::new(AtomicBool::new(true));
+    let sender_running = Arc::clone(&sender_alive);
+    let sender_addr = receiver_addr.to_owned();
+    thread::Builder::new()
+        .name("melquiades-h264-udp".into())
+        .spawn(move || {
+            let result = (|| -> Result<(), Box<dyn Error>> {
+                let mut sender = H264UdpSender::connect(&sender_addr)?;
+                let mut frames_sent = 0_u64;
+                let mut total_bytes = 0_u64;
+                let mut stale_before_send = 0_u64;
+                while let Ok(mut frame) = encoded_frames.recv() {
+                    // The queue is FIFO, but real-time media should not be.
+                    // Before committing socket work, retain the freshest
+                    // already-encoded access unit and discard older queued
+                    // units. This mirrors SenderPort::take_newest for raw
+                    // frame-pool slots.
+                    while let Ok(newer) = encoded_frames.try_recv() {
+                        frame = newer;
+                        stale_before_send += 1;
+                    }
+                    let packets = sender.send_access_unit(&frame)?;
+                    frames_sent += 1;
+                    total_bytes += frame.bytes.len() as u64;
+                    if frames_sent.is_multiple_of(300) {
+                        eprintln!(
+                            "H.264 UDP: sent={frames_sent}, stale_before_send={stale_before_send}, mean_access_unit={} bytes, last={} bytes/{} packets, keyframe={}",
+                            total_bytes / frames_sent,
+                            frame.bytes.len(),
+                            packets,
+                            frame.is_keyframe,
+                        );
+                    }
+                }
+                Ok(())
+            })();
+            sender_running.store(false, Ordering::Release);
+            if let Err(error) = result {
+                eprintln!("H.264 UDP sender stopped: {error}");
+            }
+        })?;
+
+    let mut capture = SCStream::new(&filter, &config);
+    capture.add_output_handler(
+        H264CastHandler {
+            encoder: Mutex::new(encoder),
+            outbound,
+            sender_alive,
+            started_at: Instant::now(),
+            next_frame_id: AtomicU32::new(0),
+            encoded: AtomicU32::new(0),
+            dropped_before_send: AtomicU32::new(0),
+        },
+        SCStreamOutputType::Screen,
+    );
+    eprintln!("h264 cast: sending to {receiver_addr}; press Ctrl-C to stop");
+    capture.start_capture()?;
+    thread::park();
     Ok(())
 }
 

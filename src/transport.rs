@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::capture::{FrameSource, StreamSpec};
+use crate::codec::{Codec, EncodedFrame};
 use crate::compression::{compress, decompress};
 use crate::config::{
     DATAGRAM_MAX, ECHO_BYTES, INTER_PACKET_GAP_US, LEGACY_FLAG_COMPRESSED, LEGACY_RAW_HEADER_BYTES,
@@ -12,9 +13,9 @@ use crate::config::{
 };
 use crate::metrics::{CompressionStats, FrameTimings, ReassemblyStats, SenderStats, SenderTimings};
 use crate::pipeline::{CapturePort, Pipeline, SenderPort};
-use crate::reassembly::Reassembler;
+use crate::reassembly::{H264Reassembler, Reassembler};
 use crate::time::now_nanos;
-use crate::wire::{FrameEcho, LegacyRawPacketHeader};
+use crate::wire::{FLAG_KEYFRAME, FrameEcho, LegacyRawPacketHeader, PacketHeader};
 
 fn send_datagram(socket: &UdpSocket, datagram: &[u8]) -> std::io::Result<()> {
     loop {
@@ -41,6 +42,70 @@ fn pace_after_send(sent_at: Instant) {
     let next_send_at = sent_at + std::time::Duration::from_micros(INTER_PACKET_GAP_US);
     while Instant::now() < next_send_at {
         std::hint::spin_loop();
+    }
+}
+
+/// Connected UDP sender for complete H.264 access units.
+///
+/// This keeps H.264 packetization separate from the legacy raw/Deflate
+/// sender. Its datagrams use `PacketHeader` (the `JUAN` signature), not the
+/// older 30-byte raw-frame header.
+pub struct H264UdpSender {
+    socket: UdpSocket,
+    datagram: Vec<u8>,
+}
+
+impl H264UdpSender {
+    pub fn connect(addr: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.connect(addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            datagram: vec![0; DATAGRAM_MAX],
+        })
+    }
+
+    /// Fragments and sends exactly one complete H.264 access unit.
+    ///
+    /// Packet pacing is intentionally absent in this first codec transport:
+    /// the encoder reduced normal frames to only a few datagrams. We will
+    /// measure packet loss before adding pacing back as a transport policy.
+    pub fn send_access_unit(&mut self, frame: &EncodedFrame) -> std::io::Result<u16> {
+        if frame.codec != Codec::H264 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "H.264 UDP sender received a non-H.264 frame",
+            ));
+        }
+        let total_chunks = frame.bytes.len().div_ceil(MAX_CHUNK_PAYLOAD);
+        if total_chunks == 0 || total_chunks > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "H.264 access unit of {} bytes needs {total_chunks} chunks",
+                    frame.bytes.len()
+                ),
+            ));
+        }
+
+        let flags = if frame.is_keyframe { FLAG_KEYFRAME } else { 0 };
+        for (index, payload) in frame.bytes.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
+            let header = PacketHeader {
+                flags,
+                frame_id: frame.frame_id,
+                chunk_index: index as u16,
+                total_chunks: total_chunks as u16,
+            };
+            header.encode(&mut self.datagram[..PacketHeader::BYTES]);
+            self.datagram[PacketHeader::BYTES..PacketHeader::BYTES + payload.len()]
+                .copy_from_slice(payload);
+            send_datagram(
+                &self.socket,
+                &self.datagram[..PacketHeader::BYTES + payload.len()],
+            )?;
+        }
+        Ok(total_chunks as u16)
     }
 }
 
@@ -320,5 +385,68 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                 reassembler.frame_id, error
             ),
         }
+    }
+}
+
+/// Receives and validates H.264 access units without decoding them yet.
+///
+/// This command is the safe UDP integration checkpoint. It proves that the
+/// Mac H.264 sender and Linux transport agree on fragmentation, frame IDs,
+/// flags, and reassembly before a decoder is asked to process network input.
+pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    let mut datagram = vec![0; DATAGRAM_MAX];
+    let mut reassembler = H264Reassembler::new();
+    let mut completed = 0_u64;
+    let mut dropped = 0_u64;
+
+    eprintln!("waiting for JUAN H.264 access units on UDP port 5000");
+    loop {
+        let (received, _) = socket.recv_from(&mut datagram)?;
+        let Some((header, payload)) = PacketHeader::split_datagram(&datagram[..received]) else {
+            eprintln!("malformed H.264 packet: {received} bytes");
+            continue;
+        };
+
+        if header.frame_id != reassembler.frame_id {
+            if !reassembler.is_newer_frame(header.frame_id) {
+                continue;
+            }
+            if reassembler.total_chunks > 0 && reassembler.missing() > 0 {
+                dropped += 1;
+                eprintln!(
+                    "H.264 frame {} dropped: {} of {} packets missing",
+                    reassembler.frame_id,
+                    reassembler.missing(),
+                    reassembler.total_chunks
+                );
+            }
+            if !reassembler.reset(&header) {
+                eprintln!(
+                    "refused H.264 frame {}: {} packets exceed the safety limit",
+                    header.frame_id, header.total_chunks
+                );
+                continue;
+            }
+        }
+
+        if !reassembler.add(&header, payload) {
+            continue;
+        }
+
+        completed += 1;
+        let spread_us = reassembler
+            .first_chunk_at
+            .expect("a completed H.264 frame has a first packet time")
+            .elapsed()
+            .as_micros();
+        eprintln!(
+            "H.264 frame {} complete: {} bytes in {} packets, keyframe={}, spread={}us (completed={completed}, dropped={dropped})",
+            reassembler.frame_id,
+            reassembler.bytes,
+            reassembler.total_chunks,
+            reassembler.flags & FLAG_KEYFRAME != 0,
+            spread_us,
+        );
     }
 }

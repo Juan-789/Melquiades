@@ -21,7 +21,9 @@ pub const FLAG_KEYFRAME: u8 = 0b0000_0001;
 /// H.264 access-unit fragment metadata repeated on every UDP datagram.
 ///
 /// The payload has no length field: it is every byte after `HEADER_BYTES` in
-/// the UDP datagram. A missing fragment makes the entire access unit invalid.
+/// the UDP datagram. Every fragment except the final one must be exactly
+/// `MAX_CHUNK_PAYLOAD` bytes, which makes each fragment's byte offset known.
+/// A missing fragment makes the entire access unit invalid.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketHeader {
     pub flags: u8,

@@ -5,29 +5,22 @@
 //! ScreenCaptureKit stream whose callback calls the shared
 //! `CapturePort::publish_strided` path.
 
-use std::{error::Error, time::Instant};
-use screencapturekit::prelude::{
-    CMSampleBuffer,
-    CMSampleBufferExt,
-    PixelFormat as ScreenPixelFormat,
-    SCContentFilter,
-    SCShareableContent,
-    SCStream,
-    SCStreamConfiguration,
-    SCStreamOutputTrait,
-    SCStreamOutputType,
+use crate::{
+    capture::{FrameInfo, PixelFormat as FramePixelFormat, StreamSpec},
+    pipeline::{CapturePort, Pipeline},
+    transport::stream_from_sender,
 };
-use crate::{capture::{
-    FrameInfo,
-    PixelFormat as FramePixelFormat, 
-    StreamSpec
-}, pipeline::{CapturePort, Pipeline}, transport::stream_from_sender};
+use screencapturekit::prelude::{
+    CMSampleBuffer, CMSampleBufferExt, PixelFormat as ScreenPixelFormat, SCContentFilter,
+    SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutputTrait, SCStreamOutputType,
+};
+use std::{error::Error, time::Instant};
 
 const SCREEN_WIDTH: u32 = 1920;
 const SCREEN_HEIGHT: u32 = 1080;
 const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
 
-struct Handler{
+struct Handler {
     capture: CapturePort,
     expected_stream: StreamSpec,
 }
@@ -36,16 +29,16 @@ struct Handler{
 //     fn new()
 // }
 
-impl SCStreamOutputTrait for Handler{
-    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType){
+impl SCStreamOutputTrait for Handler {
+    fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, of_type: SCStreamOutputType) {
         if of_type != SCStreamOutputType::Screen {
-        // System audio output
-        // Audio,
-        // Microphone audio output (macOS 15.0+)
-        //
-        // When using microphone capture, this output type allows separate handling
-        // of microphone audio from system audio.
-        // Microphone,
+            // System audio output
+            // Audio,
+            // Microphone audio output (macOS 15.0+)
+            //
+            // When using microphone capture, this output type allows separate handling
+            // of microphone audio from system audio.
+            // Microphone,
             return;
         }
         let capture_begins = Instant::now();
@@ -68,7 +61,7 @@ impl SCStreamOutputTrait for Handler{
             eprintln!("could not lock macOS pixel buffer");
             return;
         };
-        let frame_metadata = FrameInfo{
+        let frame_metadata = FrameInfo {
             capture_begins_at: capture_begins,
             width: self.expected_stream.width,
             height: self.expected_stream.height,
@@ -76,16 +69,15 @@ impl SCStreamOutputTrait for Handler{
             byte_len: self.expected_stream.byte_len,
             captured_at: Instant::now(),
         };
-        if let Err(error) = self.capture.publish_strided(frame_metadata, guard.as_slice(), pixel_buffer.bytes_per_row(),
+        if let Err(error) = self.capture.publish_strided(
+            frame_metadata,
+            guard.as_slice(),
+            pixel_buffer.bytes_per_row(),
         ) {
             eprint!("macos frame rehected before pool publication: {error}");
         }
-
-
     }
 }
-
-
 
 /// The macOS counterpart to Linux's portal-backed `ShareScreen` entry point.
 ///
@@ -106,18 +98,20 @@ impl ShareScreen {
         //     println!("Display #{} of width: {} and height: {}", dis, display[dis].width(),  display[dis].height());
         // }
         let filter = SCContentFilter::create()
-        .with_display(display)
-        .with_excluding_windows(&[])
-        .build();
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
 
         let config = SCStreamConfiguration::new()
             .with_width(SCREEN_WIDTH)
             .with_height(SCREEN_HEIGHT)
-            .with_pixel_format(ScreenPixelFormat::BGRA);
+            .with_pixel_format(ScreenPixelFormat::BGRA)
+            .with_fps(30);
 
         let mut stream: SCStream = SCStream::new(&filter, &config);
-        let stream_spec: StreamSpec = StreamSpec::new(SCREEN_WIDTH, SCREEN_HEIGHT, FramePixelFormat::Bgra8888)?;
-        
+        let stream_spec: StreamSpec =
+            StreamSpec::new(SCREEN_WIDTH, SCREEN_HEIGHT, FramePixelFormat::Bgra8888)?;
+
         let (capture, sender) = Pipeline::new(stream_spec).into_ports();
         let sender_addr = receiver_addr.to_owned();
         std::thread::Builder::new()
@@ -127,12 +121,14 @@ impl ShareScreen {
                     eprintln!("screen sender stopped: {error}")
                 }
             })?;
-        
+
         stream.add_output_handler(
-            Handler{
-                expected_stream: stream_spec, 
-                capture: capture },
-                SCStreamOutputType::Screen);
+            Handler {
+                expected_stream: stream_spec,
+                capture: capture,
+            },
+            SCStreamOutputType::Screen,
+        );
         stream.start_capture()?;
         eprintln!("screen capture running; press Ctrl-C to stop");
         std::thread::park();

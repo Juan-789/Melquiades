@@ -10,6 +10,8 @@ use crate::capture::{PixelFormat, StreamSpec};
 use crate::color::{bgra_to_rgb, yuyv_to_rgb};
 use crate::config::{HEIGHT, WIDTH};
 use crate::metrics::PipelineStats;
+#[cfg(target_os = "linux")]
+use crate::transport::receiving_h264_to_display;
 use crate::transport::{ReceivedFrame, receiving};
 
 pub fn display() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,12 +26,37 @@ pub fn display_with_sender(
             eprintln!("sender died: {error}");
         }
     });
+    display_with_receiver(|sender| receiving(Some(sender)))
+}
+
+/// Runs the shared native window against any receiver that emits decoded BGRA
+/// or YUYV frames. Raw/Deflate and H.264 therefore share presentation and its
+/// timing instrumentation, even though their decoding boundaries differ.
+pub fn display_with_receiver(
+    receive: impl FnOnce(
+        std::sync::mpsc::SyncSender<ReceivedFrame>,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    + Send
+    + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<ReceivedFrame>(1);
     std::thread::spawn(move || {
-        if let Err(error) = receiving(Some(sender)) {
+        if let Err(error) = receive(sender) {
             eprintln!("receiver died: {}", error);
         }
     });
+    run_display(receiver)
+}
+
+/// Receives the Mac VideoToolbox H.264 stream on Linux and displays it.
+#[cfg(target_os = "linux")]
+pub fn display_h264() -> Result<(), Box<dyn std::error::Error>> {
+    display_with_receiver(receiving_h264_to_display)
+}
+
+fn run_display(
+    receiver: std::sync::mpsc::Receiver<ReceivedFrame>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     let window = Arc::new(
         WindowBuilder::new()

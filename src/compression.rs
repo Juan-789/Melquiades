@@ -1,3 +1,9 @@
+//! The legacy raw-frame Deflate codec.
+//!
+//! H.264 is a video codec with stateful, platform-specific encoder and
+//! decoder sessions.  It intentionally lives in `crate::codec`, rather than
+//! being mixed into these stateless byte helpers.
+
 use std::io::{Read, Write};
 
 use flate2::Compression;

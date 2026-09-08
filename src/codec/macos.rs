@@ -29,6 +29,7 @@ use videotoolbox::{
 use crate::{
     capture::{PixelFormat, StreamSpec},
     codec::{Codec, EncodedFrame},
+    metrics::H264SendStats,
     transport::H264UdpSender,
 };
 
@@ -488,6 +489,7 @@ pub fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
                 let mut frames_sent = 0_u64;
                 let mut total_bytes = 0_u64;
                 let mut stale_before_send = 0_u64;
+                let mut send_stats = H264SendStats::new();
                 while let Ok(mut frame) = encoded_frames.recv() {
                     // The queue is FIFO, but real-time media should not be.
                     // Before committing socket work, retain the freshest
@@ -498,7 +500,15 @@ pub fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
                         frame = newer;
                         stale_before_send += 1;
                     }
-                    let packets = sender.send_access_unit(&frame)?;
+                    let sent = sender.send_access_unit(&frame)?;
+                    send_stats.record(
+                        frame.frame_id,
+                        frame.is_keyframe,
+                        frame.bytes.len(),
+                        sent.packets,
+                        sent.first_datagram_accepted,
+                        sent.final_datagram_accepted,
+                    );
                     frames_sent += 1;
                     total_bytes += frame.bytes.len() as u64;
                     if frames_sent.is_multiple_of(300) {
@@ -506,7 +516,7 @@ pub fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
                             "H.264 UDP: sent={frames_sent}, stale_before_send={stale_before_send}, mean_access_unit={} bytes, last={} bytes/{} packets, keyframe={}",
                             total_bytes / frames_sent,
                             frame.bytes.len(),
-                            packets,
+                            sent.packets,
                             frame.is_keyframe,
                         );
                     }

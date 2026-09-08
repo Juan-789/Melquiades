@@ -16,6 +16,7 @@ zbus = "5.19.0"
 ashpd = { version = "0.13.13", features = ["screencast"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 openh264 = "0.9.8"
+socket2 = "0.6"
 
 
 [target.'cfg(target_os = "macos")'.dependencies]

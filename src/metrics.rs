@@ -162,6 +162,94 @@ pub struct ReassemblyStats {
     outcomes: usize,
 }
 
+/// Sender-side H.264 access-unit telemetry, kept separate for predicted and
+/// keyframe units because an average obscures the burst that causes loss.
+pub struct H264SendStats {
+    predicted: H264SendClassStats,
+    keyframes: H264SendClassStats,
+    access_units: usize,
+}
+
+struct H264SendClassStats {
+    bytes: Vec<f64>,
+    packets: Vec<f64>,
+    first_to_final_send_us: Vec<f64>,
+}
+
+impl H264SendClassStats {
+    fn new() -> Self {
+        Self {
+            bytes: samples(),
+            packets: samples(),
+            first_to_final_send_us: samples(),
+        }
+    }
+
+    fn record(&mut self, bytes: usize, packets: u16, first: Instant, final_at: Instant) {
+        self.bytes.push(bytes as f64);
+        self.packets.push(packets as f64);
+        self.first_to_final_send_us.push(between(first, final_at));
+    }
+
+    fn report(&mut self, label: &str) {
+        if self.bytes.is_empty() {
+            return;
+        }
+        eprintln!("{label} over {} access units:", self.bytes.len());
+        report("  encoded_bytes", &mut self.bytes, "B");
+        report("  UDP_fragments", &mut self.packets, "");
+        report(
+            "  U0→U1 first_to_final_socket_accept",
+            &mut self.first_to_final_send_us,
+            "us",
+        );
+    }
+}
+
+impl H264SendStats {
+    pub fn new() -> Self {
+        Self {
+            predicted: H264SendClassStats::new(),
+            keyframes: H264SendClassStats::new(),
+            access_units: 0,
+        }
+    }
+
+    pub fn record(
+        &mut self,
+        frame_id: u32,
+        is_keyframe: bool,
+        encoded_bytes: usize,
+        packets: u16,
+        first: Instant,
+        final_at: Instant,
+    ) {
+        let class = if is_keyframe {
+            &mut self.keyframes
+        } else {
+            &mut self.predicted
+        };
+        class.record(encoded_bytes, packets, first, final_at);
+        self.access_units += 1;
+
+        // One line per repair point is sparse enough to correlate an IDR's
+        // exact sender burst with its receiver-side outcome.
+        if is_keyframe {
+            eprintln!(
+                "H.264 UDP keyframe: frame={frame_id} bytes={encoded_bytes} packets={packets} U0→U1={:.2}us",
+                between(first, final_at),
+            );
+        }
+
+        if self.access_units == REPORT_FRAMES {
+            eprintln!("H.264 UDP burst telemetry over {REPORT_FRAMES} access units:");
+            self.predicted.report("predicted frames");
+            self.keyframes.report("keyframes");
+            self.access_units = 0;
+        }
+    }
+}
+
 impl ReassemblyStats {
     pub fn new() -> Self {
         Self {

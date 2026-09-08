@@ -59,6 +59,19 @@ pub struct H264UdpSender {
     datagram: Vec<u8>,
 }
 
+/// Timing from the first UDP datagram accepted by the local socket through
+/// the final datagram accepted for one H.264 access unit.
+///
+/// This measures the sender-side burst that the network and receiver must
+/// absorb. It is deliberately not an end-to-end delivery measurement: UDP
+/// provides no delivery acknowledgement.
+#[derive(Clone, Copy, Debug)]
+pub struct H264SendReport {
+    pub packets: u16,
+    pub first_datagram_accepted: Instant,
+    pub final_datagram_accepted: Instant,
+}
+
 impl H264UdpSender {
     pub fn connect(addr: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -72,10 +85,10 @@ impl H264UdpSender {
 
     /// Fragments and sends exactly one complete H.264 access unit.
     ///
-    /// Packet pacing is intentionally absent in this first codec transport:
-    /// the encoder reduced normal frames to only a few datagrams. We will
-    /// measure packet loss before adding pacing back as a transport policy.
-    pub fn send_access_unit(&mut self, frame: &EncodedFrame) -> std::io::Result<u16> {
+    /// Packet pacing is intentionally absent while we measure the natural
+    /// burst shape. `H264SendReport` makes that burst observable before any
+    /// pacing policy is introduced.
+    pub fn send_access_unit(&mut self, frame: &EncodedFrame) -> std::io::Result<H264SendReport> {
         if frame.codec != Codec::H264 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -100,6 +113,8 @@ impl H264UdpSender {
         if frame.has_parameter_sets {
             flags |= FLAG_PARAMETER_SETS;
         }
+        let mut first_datagram_accepted = None;
+        let mut final_datagram_accepted = None;
         for (index, payload) in frame.bytes.chunks(MAX_CHUNK_PAYLOAD).enumerate() {
             let header = PacketHeader {
                 flags,
@@ -113,9 +128,33 @@ impl H264UdpSender {
             send_datagram(
                 &self.socket,
                 &self.datagram[..PacketHeader::BYTES + payload.len()],
-            )?;
+            )
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "H.264 UDP send failed: frame={} keyframe={} bytes={} chunk={}/{}: {error}",
+                        frame.frame_id,
+                        frame.is_keyframe,
+                        frame.bytes.len(),
+                        index,
+                        total_chunks,
+                    ),
+                )
+            })?;
+            let accepted_at = Instant::now();
+            first_datagram_accepted.get_or_insert(accepted_at);
+            final_datagram_accepted = Some(accepted_at);
         }
-        Ok(total_chunks as u16)
+        Ok(H264SendReport {
+            packets: total_chunks as u16,
+            // `total_chunks > 0` was checked above, so both timestamps were
+            // assigned in the loop unless sending returned the error above.
+            first_datagram_accepted: first_datagram_accepted
+                .expect("non-empty H.264 access unit must send a first datagram"),
+            final_datagram_accepted: final_datagram_accepted
+                .expect("non-empty H.264 access unit must send a final datagram"),
+        })
     }
 }
 
@@ -468,7 +507,22 @@ pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
 pub fn receiving_h264_to_display(
     tx: SyncSender<ReceivedFrame>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    // Configure before binding so the first keyframe burst gets the larger
+    // queue too. Linux caps the request at rmem_max and reports a doubled
+    // value for packet accounting; log the actual kernel value.
+    const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES)?;
+    let effective_buffer_bytes = socket.recv_buffer_size()?;
+    eprintln!(
+        "H.264 UDP receive buffer: requested={RECEIVE_BUFFER_BYTES} bytes, effective={effective_buffer_bytes} bytes (Linux accounting includes doubling); verify with ss -u -a -m -n 'sport = :5000'"
+    );
+    socket.bind(&"0.0.0.0:5000".parse::<std::net::SocketAddr>()?.into())?;
+    let socket: UdpSocket = socket.into();
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut reassembler = H264Reassembler::new();
     let mut decoder = LinuxH264Decoder::new()?;

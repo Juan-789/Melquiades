@@ -507,7 +507,22 @@ pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
 pub fn receiving_h264_to_display(
     tx: SyncSender<ReceivedFrame>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    // Configure before binding so the first keyframe burst gets the larger
+    // queue too. Linux caps the request at rmem_max and reports a doubled
+    // value for packet accounting; log the actual kernel value.
+    const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES)?;
+    let effective_buffer_bytes = socket.recv_buffer_size()?;
+    eprintln!(
+        "H.264 UDP receive buffer: requested={RECEIVE_BUFFER_BYTES} bytes, effective={effective_buffer_bytes} bytes (Linux accounting includes doubling); verify with ss -u -a -m -n 'sport = :5000'"
+    );
+    socket.bind(&"0.0.0.0:5000".parse::<std::net::SocketAddr>()?.into())?;
+    let socket: UdpSocket = socket.into();
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut reassembler = H264Reassembler::new();
     let mut decoder = LinuxH264Decoder::new()?;

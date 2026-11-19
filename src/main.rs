@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 streaming(capture, &addr)
             })?;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         Some("h264-display") => display::display_h264()?,
         Some("display") => display::display()?,
         _ => {

@@ -80,7 +80,7 @@ impl ShareScreen {
         Ok(())
     }
 
-    async fn authorize(self) -> Result<AuthorizedScreen, Box<dyn Error>> {
+    pub(crate) async fn authorize(self) -> Result<AuthorizedScreen, Box<dyn Error>> {
         // This is a direct zbus session-bus connection. ashpd wraps the portal
         // protocol on top of it; PipeWire is a separate connection below.
         let connection = Connection::session().await?;
@@ -145,7 +145,7 @@ impl ShareScreen {
 
 /// A portal-authorized PipeWire endpoint. Keeping the session alive keeps its
 /// monitor permission alive too.
-struct AuthorizedScreen {
+pub(crate) struct AuthorizedScreen {
     node_id: u32,
     compositor_size: Option<(i32, i32)>,
     session: Session<Screencast>,
@@ -153,7 +153,7 @@ struct AuthorizedScreen {
 }
 
 impl AuthorizedScreen {
-    fn stream_spec(&self) -> Result<StreamSpec, Box<dyn Error>> {
+    pub(crate) fn stream_spec(&self) -> Result<StreamSpec, Box<dyn Error>> {
         let (width, height) = self
             .compositor_size
             .ok_or("portal did not report the selected monitor dimensions")?;
@@ -163,7 +163,7 @@ impl AuthorizedScreen {
         StreamSpec::new(width, height, PixelFormat::Bgra8888)
     }
 
-    fn connect_pipewire(
+    pub(crate) fn connect_pipewire(
         self,
         capture: CapturePort,
         expected_stream: StreamSpec,
@@ -189,10 +189,19 @@ impl AuthorizedScreen {
             },
         )?;
 
+        let loop_on_error = main_loop.clone();
         let listener = stream
             .add_local_listener_with_user_data(ScreenCaptureState::new(capture, expected_stream))
-            .state_changed(|_, _, old, new| {
+            .state_changed(move |_, state, old, new| {
                 eprintln!("PipeWire screen stream state: {old:?} -> {new:?}");
+                if matches!(
+                    new,
+                    pipewire::stream::StreamState::Error(_)
+                        | pipewire::stream::StreamState::Unconnected
+                ) {
+                    state.capture.stop();
+                    loop_on_error.quit();
+                }
             })
             .param_changed(|_, state, id, param| {
                 state.observe_format(id, param);
@@ -412,7 +421,7 @@ impl ScreenCaptureState {
 /// Owns the resources whose lifetimes must outlive the PipeWire stream
 /// callback. Field order matters: listener unregisters before stream drops,
 /// and stream keeps its core alive independently.
-struct PipeWireRemote {
+pub(crate) struct PipeWireRemote {
     node_id: u32,
     _session: Session<Screencast>,
     _listener: StreamListener<ScreenCaptureState>,
@@ -422,6 +431,29 @@ struct PipeWireRemote {
 }
 
 impl PipeWireRemote {
+    pub(crate) fn run_until(
+        &self,
+        should_stop: impl Fn() -> bool + 'static,
+    ) -> Result<(), Box<dyn Error>> {
+        let main_loop = self.main_loop.clone();
+        let timer = self.main_loop.loop_().add_timer(move |_| {
+            if should_stop() {
+                main_loop.quit();
+            }
+        });
+        timer
+            .update_timer(
+                Some(std::time::Duration::from_millis(100)),
+                Some(std::time::Duration::from_millis(100)),
+            )
+            .into_result()?;
+        self.main_loop.run();
+        if let pipewire::stream::StreamState::Error(error) = self._stream.state() {
+            return Err(format!("PipeWire capture failed: {error}").into());
+        }
+        Ok(())
+    }
+
     fn run(&self) {
         self.main_loop.run();
     }

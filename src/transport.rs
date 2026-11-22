@@ -322,6 +322,7 @@ pub struct ReceivedFrame {
     pub pixels: Vec<u8>,
     pub stream: StreamSpec,
     pub timings: FrameTimings,
+    pub frame_id: u32,
 }
 
 pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn std::error::Error>> {
@@ -422,6 +423,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                                 t1_decode_begins,
                                 t2_decode_ends,
                             },
+                            frame_id: reassembler.frame_id,
                         };
                         let _ = tx.try_send(frame);
                     }
@@ -600,6 +602,7 @@ pub fn receiving_h264_to_display(
                         t1_decode_begins,
                         t2_decode_ends,
                     },
+                    frame_id: reassembler.frame_id,
                 });
             }
             Ok(None) => {
@@ -722,6 +725,7 @@ pub fn receiving_h264_to_display(
                         t1_decode_begins,
                         t2_decode_ends,
                     },
+                    frame_id: reassembler.frame_id,
                 });
             }
             Ok(None) => {

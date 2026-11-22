@@ -5,7 +5,7 @@
 //! handoff, compression, UDP transport, and receiver—remains shared Rust.
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 

@@ -49,9 +49,16 @@ pub fn display_with_receiver(
 }
 
 /// Receives the Mac VideoToolbox H.264 stream on Linux and displays it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn display_h264() -> Result<(), Box<dyn std::error::Error>> {
-    display_with_receiver(receiving_h264_to_display)
+    // #[cfg(target_os="linux")] {
+    //     let recv = crate::transport::receiving_h264_to_display;
+    // }
+    // #[cfg(target_os="windows")] {
+    //     let recv = crate::transport::receiving_h264_to_display;
+    // }
+
+    display_with_receiver(crate::transport::receiving_h264_to_display)
 }
 
 fn run_display(

@@ -3,6 +3,7 @@ mod codec;
 mod color;
 mod compression;
 mod config;
+mod prediction;
 mod display;
 mod metrics;
 mod pipeline;

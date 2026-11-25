@@ -240,6 +240,11 @@ impl AuthorizedScreen {
                     height: expected_stream.height,
                 }
             ),
+            spa::pod::property!(
+                spa::param::format::FormatProperties::VideoFramerate,
+                Fraction,
+                spa::utils::Fraction { num: 30, denom: 1 }
+            ),
         );
         let bytes = spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),
@@ -325,8 +330,11 @@ impl ScreenCaptureState {
             && size.height == self.expected_stream.height;
         if self.negotiated_format {
             eprintln!(
-                "PipeWire negotiated BGRx {}x{}; copying into tight BGRA pool slots",
-                size.width, size.height
+                "PipeWire negotiated BGRx {}x{} at {}/{} fps; copying into tight BGRA pool slots",
+                size.width,
+                size.height,
+                format.framerate().num,
+                format.framerate().denom,
             );
         } else {
             eprintln!(

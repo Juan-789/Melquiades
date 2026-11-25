@@ -199,26 +199,32 @@ fn encode_captured_frames(
     let mut yuv = YUVBuffer::new(stream.width as usize, stream.height as usize);
     let started = Instant::now();
     let mut next_frame = started;
+    let mut have_frame = false;
     while frames.capture_is_running() {
         let now = Instant::now();
         if now < next_frame {
             thread::sleep((next_frame - now).min(Duration::from_millis(5)));
             continue;
         }
-        let Some(id) = frames.take_newest() else {
+        if let Some(id) = frames.take_newest() {
+            frames.with_frame(&id, |_info, bytes| {
+                yuv.read_bgra8(BgraSliceU8::new(
+                    bytes,
+                    (stream.width as usize, stream.height as usize),
+                ));
+            });
+            frames.return_to_free(id);
+            have_frame = true;
+        }
+        if !have_frame {
             thread::sleep(Duration::from_millis(1));
             continue;
-        };
-        let timestamp = frames.with_frame(&id, |info, bytes| {
-            yuv.read_bgra8(BgraSliceU8::new(
-                bytes,
-                (stream.width as usize, stream.height as usize),
-            ));
-            info.captured_at
-                .saturating_duration_since(started)
-                .as_micros() as u64
-        });
-        frames.return_to_free(id);
+        }
+        // Portal screen capture may be damage-driven: a static desktop need
+        // not produce a fresh PipeWire buffer every 33 ms. Encode the newest
+        // retained image on every presentation tick so frame-count-based GOP
+        // recovery and receiver playback still advance at a real 30 Hz.
+        let timestamp = now.saturating_duration_since(started).as_micros() as u64;
         encoder.encode_and_send(&yuv, timestamp, &outbound)?;
         next_frame = now + Duration::from_secs_f64(1.0 / 30.0);
     }

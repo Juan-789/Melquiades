@@ -1,10 +1,3 @@
-//! Linux H.264 decode boundary backed by Cisco OpenH264.
-//!
-//! This is intentionally a correctness-first software decoder. It accepts
-//! decoder-ready Annex B access units from the UDP transport and produces
-//! tightly packed BGRA pixels for the existing Softbuffer renderer. Hardware
-//! decode through VA-API is a later, separately measurable optimization.
-
 use std::{
     error::Error,
     sync::mpsc::{SyncSender, sync_channel},
@@ -39,7 +32,6 @@ pub struct DecodedH264Frame {
 }
 
 /// Persistent OpenH264 decoder plus reusable conversion storage.
-///
 /// OpenH264 exposes borrowed YUV420 planes, valid only until the next decode.
 /// We convert them before returning, so no decoder-owned pointer crosses into
 /// the window thread.
@@ -172,9 +164,23 @@ fn start_h264_sender(
         .name("melquiades-h264-udp".into())
         .spawn(move || {
             let mut stats = H264SendStats::new();
+            let started = Instant::now();
+            let mut report_since = Instant::now();
+            let mut frames_sent = 0_u64;
+            let mut bytes_sent = 0_u64;
+            let mut packets_sent = 0_u64;
+            let mut send_total_ms = 0.0_f64;
+            let mut send_max_ms = 0.0_f64;
             // Preserve encoded frame order: later frames may reference earlier ones.
             while let Ok(frame) = encoded_frames.recv() {
+                let send_started = Instant::now();
                 let sent = sender.send_access_unit(&frame)?;
+                let send_ms = send_started.elapsed().as_secs_f64() * 1000.0;
+                frames_sent += 1;
+                bytes_sent += frame.bytes.len() as u64;
+                packets_sent += u64::from(sent.packets);
+                send_total_ms += send_ms;
+                send_max_ms = send_max_ms.max(send_ms);
                 stats.record(
                     frame.frame_id,
                     frame.is_keyframe,
@@ -183,6 +189,24 @@ fn start_h264_sender(
                     sent.first_datagram_accepted,
                     sent.final_datagram_accepted,
                 );
+                if report_since.elapsed() >= Duration::from_secs(2) {
+                    let window_s = report_since.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[{:.3}s] H264 UDP TX: frames={:.1}fps bytes={:.2}MB/s packets={:.1}/s send_avg={:.2}ms send_max={:.2}ms",
+                        started.elapsed().as_secs_f64(),
+                        frames_sent as f64 / window_s,
+                        bytes_sent as f64 / window_s / 1_000_000.0,
+                        packets_sent as f64 / window_s,
+                        send_total_ms / frames_sent.max(1) as f64,
+                        send_max_ms,
+                    );
+                    report_since = Instant::now();
+                    frames_sent = 0;
+                    bytes_sent = 0;
+                    packets_sent = 0;
+                    send_total_ms = 0.0;
+                    send_max_ms = 0.0;
+                }
             }
             Ok(())
         })?;
@@ -200,6 +224,14 @@ fn encode_captured_frames(
     let started = Instant::now();
     let mut next_frame = started;
     let mut have_frame = false;
+    let mut report_since = Instant::now();
+    let mut encoded_ticks = 0_u64;
+    let mut fresh_frames = 0_u64;
+    let mut repeated_frames = 0_u64;
+    let mut conversion_total_ms = 0.0_f64;
+    let mut conversion_max_ms = 0.0_f64;
+    let mut encode_queue_total_ms = 0.0_f64;
+    let mut encode_queue_max_ms = 0.0_f64;
     while frames.capture_is_running() {
         let now = Instant::now();
         if now < next_frame {
@@ -207,6 +239,7 @@ fn encode_captured_frames(
             continue;
         }
         if let Some(id) = frames.take_newest() {
+            let conversion_started = Instant::now();
             frames.with_frame(&id, |_info, bytes| {
                 yuv.read_bgra8(BgraSliceU8::new(
                     bytes,
@@ -214,7 +247,13 @@ fn encode_captured_frames(
                 ));
             });
             frames.return_to_free(id);
+            let conversion_ms = conversion_started.elapsed().as_secs_f64() * 1000.0;
+            conversion_total_ms += conversion_ms;
+            conversion_max_ms = conversion_max_ms.max(conversion_ms);
+            fresh_frames += 1;
             have_frame = true;
+        } else if have_frame {
+            repeated_frames += 1;
         }
         if !have_frame {
             thread::sleep(Duration::from_millis(1));
@@ -225,8 +264,35 @@ fn encode_captured_frames(
         // retained image on every presentation tick so frame-count-based GOP
         // recovery and receiver playback still advance at a real 30 Hz.
         let timestamp = now.saturating_duration_since(started).as_micros() as u64;
+        let encode_started = Instant::now();
         encoder.encode_and_send(&yuv, timestamp, &outbound)?;
+        let encode_queue_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        encode_queue_total_ms += encode_queue_ms;
+        encode_queue_max_ms = encode_queue_max_ms.max(encode_queue_ms);
+        encoded_ticks += 1;
         next_frame = now + Duration::from_secs_f64(1.0 / 30.0);
+        if report_since.elapsed() >= Duration::from_secs(2) {
+            let window_s = report_since.elapsed().as_secs_f64();
+            eprintln!(
+                "[{:.3}s] H264 ENCODE: output={:.1}fps fresh={} repeated={} | BGRA->YUV avg={:.2}ms max={:.2}ms | encode+queue avg={:.2}ms max={:.2}ms",
+                started.elapsed().as_secs_f64(),
+                encoded_ticks as f64 / window_s,
+                fresh_frames,
+                repeated_frames,
+                conversion_total_ms / fresh_frames.max(1) as f64,
+                conversion_max_ms,
+                encode_queue_total_ms / encoded_ticks.max(1) as f64,
+                encode_queue_max_ms,
+            );
+            report_since = Instant::now();
+            encoded_ticks = 0;
+            fresh_frames = 0;
+            repeated_frames = 0;
+            conversion_total_ms = 0.0;
+            conversion_max_ms = 0.0;
+            encode_queue_total_ms = 0.0;
+            encode_queue_max_ms = 0.0;
+        }
     }
     Ok(())
 }

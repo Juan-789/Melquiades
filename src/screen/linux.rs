@@ -240,11 +240,6 @@ impl AuthorizedScreen {
                     height: expected_stream.height,
                 }
             ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoFramerate,
-                Fraction,
-                spa::utils::Fraction { num: 30, denom: 1 }
-            ),
         );
         let bytes = spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),

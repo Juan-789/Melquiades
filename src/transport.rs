@@ -147,6 +147,9 @@ impl H264UdpSender {
             let accepted_at = Instant::now();
             first_datagram_accepted.get_or_insert(accepted_at);
             final_datagram_accepted = Some(accepted_at);
+            if index + 1 < total_chunks {
+               pace_after_send(accepted_at);
+            }
         }
         Ok(H264SendReport {
             packets: total_chunks as u16,
@@ -447,7 +450,28 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
 /// Mac H.264 sender and Linux transport agree on fragmentation, frame IDs,
 /// flags, and reassembly before a decoder is asked to process network input.
 pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:5000")?;
+    
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+
+    socket.set_recv_buffer_size(4 * 1024 * 1024)?;
+
+    eprintln!(
+        "Diagnostic UDP receive buffer: {} bytes",
+        socket.recv_buffer_size()?
+    );
+
+    socket.bind(
+        &"0.0.0.0:5000"
+            .parse::<std::net::SocketAddr>()?
+            .into(),
+    )?;
+
+    let socket: UdpSocket = socket.into();
+
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut reassembler = H264Reassembler::new();
     let mut completed = 0_u64;

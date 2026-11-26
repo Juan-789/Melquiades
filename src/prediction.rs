@@ -1,7 +1,3 @@
-// Off-thread IPC bridge between Melquiades and the Python DMVFN server.
-// The event loop submits a seed pair with `try_send` and polls results with
-// `try_recv`; it never blocks on TCP or CUDA inference.
-
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -9,13 +5,10 @@ use std::thread;
 use std::time::Duration;
 
 pub struct PredictionRequest {
-    /// ID assigned to the first future frame, not to either seed frame.
     pub target_id: u32,
     pub width: u32,
     pub height: u32,
-    /// Consecutive recursive predictions to generate (1..=150).
     pub count: u32,
-    /// Tightly packed BGRA pixels.
     pub frame_a: Vec<u8>,
     pub frame_b: Vec<u8>,
 }
@@ -24,41 +17,39 @@ pub struct PredictionResult {
     pub frame_id: u32,
     pub width: u32,
     pub height: u32,
-    /// Tightly packed BGR pixels, 3 bytes per pixel.
     pub pixels: Vec<u8>,
 }
 
 pub fn spawn_worker() -> (
     SyncSender<PredictionRequest>,
-    Receiver<PredictionResult>,
+    Receiver<io::Result<PredictionResult>>,
 ) {
-    // one pending seed request: never block the display event loop.
     let (request_tx, request_rx) = mpsc::sync_channel(1);
-    // remporary unbounded result queue to verify all 21 IDs arrive.
-    // Replace with deadline-aware bounded buffering before sustained use.
     let (result_tx, result_rx) = mpsc::channel();
 
     thread::Builder::new()
         .name("dmvfn-worker".into())
         .spawn(move || {
-            let mut stream = match TcpStream::connect("127.0.0.1:5055") {
-                Ok(stream) => stream,
-                Err(error) => {
-                    eprintln!("DMVFN connection failed: {error}; start Python first");
-                    return;
-                }
-            };
-            if let Err(error) = stream.set_nodelay(true) {
-                eprintln!("Could not set TCP_NODELAY: {error}");
-            }
-            if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(10))) {
-                eprintln!("Could not set read timeout: {error}");
-            }
-
+            let mut connection = None;
             for request in request_rx {
-                if let Err(error) = exchange(&mut stream, request, &result_tx) {
-                    eprintln!("DMVFN IPC exchange failed: {error}");
-                    break;
+                let result = (|| {
+                    let stream = match &mut connection {
+                        Some(stream) => stream,
+                        None => {
+                            let stream = TcpStream::connect("127.0.0.1:5055")?;
+                            stream.set_nodelay(true)?;
+                            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                            connection.insert(stream)
+                        }
+                    };
+                    exchange(stream, request, &result_tx)
+                })();
+                if let Err(error) = result {
+                    connection = None;
+                    if result_tx.send(Err(error)).is_err() {
+                        break;
+                    }
                 }
             }
         })
@@ -70,7 +61,7 @@ pub fn spawn_worker() -> (
 fn exchange(
     stream: &mut TcpStream,
     request: PredictionRequest,
-    result_tx: &Sender<PredictionResult>,
+    result_tx: &Sender<io::Result<PredictionResult>>,
 ) -> io::Result<()> {
     if request.count == 0 || request.count > 150 {
         return Err(io::Error::other("count must be 1..=150"));
@@ -86,7 +77,6 @@ fn exchange(
         return Err(io::Error::other("expected tightly packed BGRA seed frames"));
     }
 
-    // 20-byte request header. Must match Python struct.unpack('<4sIIII', ...).
     stream.write_all(b"SEED")?;
     stream.write_all(&request.target_id.to_le_bytes())?;
     stream.write_all(&request.width.to_le_bytes())?;
@@ -118,12 +108,12 @@ fn exchange(
         stream.read_exact(&mut pixels)?;
 
         result_tx
-            .send(PredictionResult {
+            .send(Ok(PredictionResult {
                 frame_id,
                 width,
                 height,
                 pixels,
-            })
+            }))
             .map_err(|_| io::Error::other("display closed the results channel"))?;
     }
     Ok(())

@@ -14,13 +14,9 @@ use crate::metrics::PipelineStats;
 use crate::transport::{ReceivedFrame, receiving};
 
 #[cfg(target_os = "windows")]
-#[path = "cv_capture.rs"]
-mod cv_capture;
-
+use crate::recording::Recorder;
 #[cfg(target_os = "windows")]
-use crate::prediction::{PredictionRequest, PredictionResult, spawn_worker};
-#[cfg(target_os = "windows")]
-use cv_capture::CaptureWriter;
+use std::collections::VecDeque;
 
 pub fn display() -> Result<(), Box<dyn std::error::Error>> {
     display_with_sender(|| Ok(()))
@@ -87,9 +83,14 @@ fn run_display(
 
     let mut displayed_stream = StreamSpec::new(WIDTH as u32, HEIGHT as u32, PixelFormat::Yuyv422)?;
     let mut pipeline_stats = PipelineStats::new();
+    let started = Instant::now();
 
     #[cfg(target_os = "windows")]
-    let mut experiment = Experiment::new();
+    let mut history: VecDeque<ReceivedFrame> = VecDeque::with_capacity(2);
+    #[cfg(target_os = "windows")]
+    let mut recorder = Recorder::new();
+    #[cfg(target_os = "windows")]
+    let finalize_wake = event_loop.create_proxy();
 
     event_loop.run(move |event, event_loop| {
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -107,10 +108,37 @@ fn run_display(
             } if key.state.is_pressed()
                 && matches!(
                     key.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter)
+                ) =>
+            {
+                eprintln!("normal display mode");
+            }
+
+            #[cfg(target_os = "windows")]
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event: key, .. },
+                ..
+            } if key.state.is_pressed()
+                && matches!(
+                    key.logical_key,
                     winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space)
                 ) =>
             {
-                experiment.toggle();
+                let now = timestamp_ms(started, Instant::now());
+                if recorder.is_active() {
+                    recorder.stop(now, finalize_wake.clone());
+                } else if history.len() == 2 {
+                    let seeds = [history.pop_front().unwrap(), history.pop_front().unwrap()];
+                    let seed_timestamps = [
+                        timestamp_ms(started, seeds[0].timings.t2_decode_ends),
+                        timestamp_ms(started, seeds[1].timings.t2_decode_ends),
+                    ];
+                    if let Err(error) = recorder.start(seeds, seed_timestamps, now) {
+                        eprintln!("recording did not start: {error}");
+                    }
+                } else {
+                    eprintln!("recording needs two consecutive decoded frames");
+                }
             }
 
             Event::WindowEvent {
@@ -127,7 +155,7 @@ fn run_display(
 
             Event::AboutToWait => {
                 #[cfg(target_os = "windows")]
-                experiment.drain_results();
+                recorder.poll();
 
                 while let Ok(frame) = receiver.try_recv() {
                     if frame.stream != displayed_stream {
@@ -154,7 +182,23 @@ fn run_display(
                     pipeline_stats.record(&frame.timings, submitted, Instant::now());
 
                     #[cfg(target_os = "windows")]
-                    experiment.record(&frame);
+                    {
+                        let timestamp = timestamp_ms(started, frame.timings.t2_decode_ends);
+                        if recorder.is_active() {
+                            recorder.record(frame, timestamp);
+                        } else {
+                            if history.back().is_some_and(|previous: &ReceivedFrame| {
+                                previous.frame_id.wrapping_add(1) != frame.frame_id
+                                    || previous.stream != frame.stream
+                            }) {
+                                history.clear();
+                            }
+                            if history.len() == 2 {
+                                history.pop_front();
+                            }
+                            history.push_back(frame);
+                        }
+                    }
                 }
             }
 
@@ -164,174 +208,6 @@ fn run_display(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-struct Experiment {
-    capture: CaptureWriter,
-    request_tx: std::sync::mpsc::SyncSender<PredictionRequest>,
-    result_rx: std::sync::mpsc::Receiver<std::io::Result<PredictionResult>>,
-    run: Option<u32>,
-    next_run: u32,
-    previous: Option<SeedFrame>,
-    pending: Option<(u32, u32)>,
-}
-
-#[cfg(target_os = "windows")]
-struct SeedFrame {
-    frame_id: u32,
-    stream: StreamSpec,
-    pixels: Vec<u8>,
-}
-
-#[cfg(target_os = "windows")]
-impl Experiment {
-    fn new() -> Self {
-        let (request_tx, result_rx) = spawn_worker();
-        Self {
-            capture: CaptureWriter::new(),
-            request_tx,
-            result_rx,
-            run: None,
-            next_run: 1,
-            previous: None,
-            pending: None,
-        }
-    }
-
-    fn toggle(&mut self) {
-        if let Some(run) = self.run.take() {
-            self.previous = None;
-            eprintln!("inference capture run {run} stopped");
-            return;
-        }
-        if self.pending.is_some() {
-            eprintln!("waiting for the previous inference capture to finish");
-            return;
-        }
-        let run = self.next_run;
-        self.next_run = self.next_run.wrapping_add(1);
-        self.run = Some(run);
-        self.previous = None;
-        eprintln!(
-            "inference capture run {run} started at {}",
-            self.capture.root.display()
-        );
-    }
-
-    fn record(&mut self, frame: &ReceivedFrame) {
-        let Some(run) = self.run else { return };
-        let Some(image) = preview_from_frame(frame) else {
-            return;
-        };
-        self.capture.record(run, "actual", frame.frame_id, &image);
-
-        if self.pending.is_some() {
-            return;
-        }
-        let seed = SeedFrame {
-            frame_id: frame.frame_id,
-            stream: frame.stream,
-            pixels: frame.pixels.clone(),
-        };
-        let Some(previous) = self.previous.replace(seed) else {
-            return;
-        };
-        if previous.frame_id.wrapping_add(1) != frame.frame_id
-            || previous.stream != frame.stream
-            || frame.stream.format != PixelFormat::Bgra8888
-        {
-            return;
-        }
-        let request = PredictionRequest {
-            target_id: frame.frame_id.wrapping_add(1),
-            width: frame.stream.width,
-            height: frame.stream.height,
-            count: 30,
-            frame_a: previous.pixels,
-            frame_b: frame.pixels.clone(),
-        };
-        if self.request_tx.try_send(request).is_ok() {
-            self.pending = Some((run, 30));
-            eprintln!("inference capture run {run} queued");
-        }
-    }
-
-    fn drain_results(&mut self) {
-        while let Ok(result) = self.result_rx.try_recv() {
-            let Some((run, remaining)) = self.pending else {
-                continue;
-            };
-            match result {
-                Ok(frame) => {
-                    if let Some(image) = preview_from_prediction(&frame) {
-                        self.capture.record(run, "inferred", frame.frame_id, &image);
-                    }
-                    self.pending = (remaining > 1).then_some((run, remaining - 1));
-                    if self.pending.is_none() {
-                        eprintln!("inference capture run {run} finished");
-                    }
-                }
-                Err(error) => {
-                    self.pending = None;
-                    eprintln!("inference capture run {run} failed: {error}");
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-const RESULT_WIDTH: usize = 448;
-#[cfg(target_os = "windows")]
-const RESULT_HEIGHT: usize = 256;
-
-#[cfg(target_os = "windows")]
-fn preview_from_frame(frame: &ReceivedFrame) -> Option<Vec<u32>> {
-    if frame.stream.format != PixelFormat::Bgra8888 || frame.pixels.len() != frame.stream.byte_len {
-        return None;
-    }
-    let width = frame.stream.width as usize;
-    let height = frame.stream.height as usize;
-    resize_pixels(width, height, |x, y| {
-        let offset = (y * width + x) * 4;
-        (u32::from(frame.pixels[offset + 2]) << 16)
-            | (u32::from(frame.pixels[offset + 1]) << 8)
-            | u32::from(frame.pixels[offset])
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn preview_from_prediction(frame: &PredictionResult) -> Option<Vec<u32>> {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    if width == 0
-        || height == 0
-        || frame.pixels.len() != width.checked_mul(height)?.checked_mul(3)?
-    {
-        return None;
-    }
-    resize_pixels(width, height, |x, y| {
-        let offset = (y * width + x) * 3;
-        (u32::from(frame.pixels[offset + 2]) << 16)
-            | (u32::from(frame.pixels[offset + 1]) << 8)
-            | u32::from(frame.pixels[offset])
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn resize_pixels(
-    width: usize,
-    height: usize,
-    mut pixel: impl FnMut(usize, usize) -> u32,
-) -> Option<Vec<u32>> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let mut result = vec![0; RESULT_WIDTH * RESULT_HEIGHT];
-    for y in 0..RESULT_HEIGHT {
-        let source_y = y * height / RESULT_HEIGHT;
-        for x in 0..RESULT_WIDTH {
-            result[y * RESULT_WIDTH + x] = pixel(x * width / RESULT_WIDTH, source_y);
-        }
-    }
-    Some(result)
+fn timestamp_ms(origin: Instant, timestamp: Instant) -> u128 {
+    timestamp.saturating_duration_since(origin).as_millis()
 }

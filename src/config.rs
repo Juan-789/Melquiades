@@ -17,6 +17,11 @@ pub const ECHO_BYTES: usize = 20;
 pub const LEGACY_RAW_MAGIC: u16 = 0xADC0;
 pub const LEGACY_FLAG_COMPRESSED: u8 = 1;
 pub const DATAGRAM_MAX: usize = LEGACY_RAW_HEADER_BYTES + MAX_CHUNK_PAYLOAD;
+pub const H264_TARGET_FPS: u32 = 30;
+#[cfg(any(target_os = "linux", all(test, target_os = "windows")))]
+pub const H264_KEYFRAME_INTERVAL: u32 = H264_TARGET_FPS;
+pub const H264_FRAME_PERIOD: std::time::Duration =
+    std::time::Duration::from_nanos(1_000_000_000 / H264_TARGET_FPS as u64);
 /// Experimental pacing between accepted UDP datagrams. This smooths one frame's
 /// packet burst so we can measure whether queue pressure is causing loss.
 pub const INTER_PACKET_GAP_US: u64 = 25;

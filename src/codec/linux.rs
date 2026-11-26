@@ -4,26 +4,30 @@ use std::{
     thread,
 };
 
-use crate::pipeline::{Pipeline, SenderPort};
+#[cfg(test)]
+use crate::pipeline::Pipeline;
+use crate::pipeline::SenderPort;
 use crate::{
     capture::{PixelFormat, StreamSpec},
     codec::{Codec, EncodedFrame},
+    config::{H264_FRAME_PERIOD, H264_KEYFRAME_INTERVAL, H264_TARGET_FPS},
     metrics::H264SendStats,
     transport::H264UdpSender,
 };
 use openh264::{
     OpenH264API,
     decoder::Decoder,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType},
+    encoder::{
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType,
+    },
     formats::{BgraSliceU8, YUVBuffer, YUVSource},
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 /// An owned displayable image decoded from one complete H.264 access unit.
 pub struct DecodedH264Frame {
@@ -87,6 +91,8 @@ impl LinuxH264Decoder {
 pub struct LinuxH264Encoder {
     encoder: Encoder,
     next_frame_id: u32,
+    last_keyframe_us: Option<u64>,
+    startup_retry: bool,
 }
 
 impl LinuxH264Encoder {
@@ -96,11 +102,16 @@ impl LinuxH264Encoder {
                 OpenH264API::from_source(),
                 EncoderConfig::new()
                     .bitrate(BitRate::from_bps(8_000_000))
-                    .max_frame_rate(FrameRate::from_hz(30.0))
+                    .max_frame_rate(FrameRate::from_hz(H264_TARGET_FPS as f32))
+                    .complexity(Complexity::Low)
                     .usage_type(UsageType::ScreenContentRealTime)
-                    .intra_frame_period(IntraFramePeriod::from_num_frames(30)),
+                    .adaptive_quantization(false)
+                    .background_detection(false)
+                    .intra_frame_period(IntraFramePeriod::from_num_frames(H264_KEYFRAME_INTERVAL)),
             )?,
             next_frame_id: 0,
+            last_keyframe_us: None,
+            startup_retry: true,
         })
     }
 
@@ -115,10 +126,20 @@ impl LinuxH264Encoder {
         frame: &impl YUVSource,
         source_pts_us: u64,
         outbound: &SyncSender<EncodedFrame>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<bool, Box<dyn Error>> {
+        if let Some(previous) = self.last_keyframe_us {
+            let interval = if self.startup_retry {
+                250_000
+            } else {
+                1_000_000
+            };
+            if source_pts_us.saturating_sub(previous) >= interval {
+                self.encoder.force_intra_frame();
+            }
+        }
         let bytes = self.encode(frame)?;
         if bytes.is_empty() {
-            return Ok(()); // OpenH264 may skip a frame.
+            return Ok(false);
         }
         let mut is_keyframe = false;
         let mut has_sps = false;
@@ -135,6 +156,11 @@ impl LinuxH264Encoder {
                 _ => {}
             }
         }
+        if is_keyframe && has_sps && has_pps {
+            if self.last_keyframe_us.replace(source_pts_us).is_some() {
+                self.startup_retry = false;
+            }
+        }
         outbound.send(EncodedFrame {
             frame_id: self.next_frame_id,
             codec: Codec::H264,
@@ -144,7 +170,7 @@ impl LinuxH264Encoder {
             bytes,
         })?;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -174,7 +200,11 @@ fn start_h264_sender(
             // Preserve encoded frame order: later frames may reference earlier ones.
             while let Ok(frame) = encoded_frames.recv() {
                 let send_started = Instant::now();
-                let sent = sender.send_access_unit(&frame)?;
+                let sent = match sender.send_access_unit(&frame) {
+                    Ok(sent) => sent,
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset) => continue,
+                    Err(error) => return Err(error),
+                };
                 let send_ms = send_started.elapsed().as_secs_f64() * 1000.0;
                 frames_sent += 1;
                 bytes_sent += frame.bytes.len() as u64;
@@ -213,19 +243,44 @@ fn start_h264_sender(
     Ok((outbound, worker))
 }
 
-/// Consumes only owned pool frames; PipeWire's callback never waits on encoding.
+fn encode_size(width: usize, height: usize, native: bool) -> (usize, usize) {
+    if native {
+        return ((width & !1).max(2), (height & !1).max(2));
+    }
+    let (max_w, max_h) = if width >= height {
+        (960, 540)
+    } else {
+        (540, 960)
+    };
+    let scale = (max_w as f64 / width as f64)
+        .min(max_h as f64 / height as f64)
+        .min(1.0);
+    let even = |n: usize| ((n as f64 * scale).round() as usize & !1).max(2);
+    (even(width), even(height))
+}
+
 fn encode_captured_frames(
     frames: SenderPort,
     stream: StreamSpec,
+    size: (usize, usize),
     outbound: SyncSender<EncodedFrame>,
     mut encoder: LinuxH264Encoder,
 ) -> Result<(), Box<dyn Error>> {
-    let mut yuv = YUVBuffer::new(stream.width as usize, stream.height as usize);
+    let (source_w, source_h) = (stream.width as usize, stream.height as usize);
+    let (width, height) = size;
+    let resize = (width, height) != (source_w, source_h);
+    let mut scaled = vec![0; if resize { width * height * 4 } else { 0 }];
+    let columns: Vec<_> = (0..width)
+        .map(|x| ((2 * x + 1) * source_w / (2 * width)) * 4)
+        .collect();
+    let mut yuv = YUVBuffer::new(width, height);
     let started = Instant::now();
     let mut next_frame = started;
     let mut have_frame = false;
+    let mut first_capture = None;
     let mut report_since = Instant::now();
     let mut encoded_ticks = 0_u64;
+    let mut output_frames = 0_u64;
     let mut fresh_frames = 0_u64;
     let mut repeated_frames = 0_u64;
     let mut conversion_total_ms = 0.0_f64;
@@ -240,11 +295,24 @@ fn encode_captured_frames(
         }
         if let Some(id) = frames.take_newest() {
             let conversion_started = Instant::now();
-            frames.with_frame(&id, |_info, bytes| {
-                yuv.read_bgra8(BgraSliceU8::new(
-                    bytes,
-                    (stream.width as usize, stream.height as usize),
-                ));
+            frames.with_frame(&id, |info, bytes| {
+                if !have_frame {
+                    first_capture = Some(info.capture_begins_at);
+                }
+                let pixels = if resize {
+                    for (y, row) in scaled.chunks_exact_mut(width * 4).enumerate() {
+                        let sy = (2 * y + 1) * source_h / (2 * height);
+                        let start = sy * source_w * 4;
+                        let source = &bytes[start..start + source_w * 4];
+                        for (pixel, &x) in row.chunks_exact_mut(4).zip(&columns) {
+                            pixel.copy_from_slice(&source[x..x + 4]);
+                        }
+                    }
+                    &scaled[..]
+                } else {
+                    bytes
+                };
+                yuv.read_bgra8(BgraSliceU8::new(pixels, (width, height)));
             });
             frames.return_to_free(id);
             let conversion_ms = conversion_started.elapsed().as_secs_f64() * 1000.0;
@@ -259,24 +327,33 @@ fn encode_captured_frames(
             thread::sleep(Duration::from_millis(1));
             continue;
         }
-        // Portal screen capture may be damage-driven: a static desktop need
-        // not produce a fresh PipeWire buffer every 33 ms. Encode the newest
-        // retained image on every presentation tick so frame-count-based GOP
-        // recovery and receiver playback still advance at a real 30 Hz.
         let timestamp = now.saturating_duration_since(started).as_micros() as u64;
         let encode_started = Instant::now();
-        encoder.encode_and_send(&yuv, timestamp, &outbound)?;
+        let queued = encoder.encode_and_send(&yuv, timestamp, &outbound)?;
         let encode_queue_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+        if queued {
+            output_frames += 1;
+            if let Some(start) = first_capture.take() {
+                eprintln!(
+                    "first h264 picture queued {:.2} ms after capture began",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
         encode_queue_total_ms += encode_queue_ms;
         encode_queue_max_ms = encode_queue_max_ms.max(encode_queue_ms);
         encoded_ticks += 1;
-        next_frame = now + Duration::from_secs_f64(1.0 / 30.0);
+        next_frame += H264_FRAME_PERIOD;
+        let after_encode = Instant::now();
+        if next_frame <= after_encode {
+            next_frame = after_encode;
+        }
         if report_since.elapsed() >= Duration::from_secs(2) {
             let window_s = report_since.elapsed().as_secs_f64();
             eprintln!(
-                "[{:.3}s] H264 ENCODE: output={:.1}fps fresh={} repeated={} | BGRA->YUV avg={:.2}ms max={:.2}ms | encode+queue avg={:.2}ms max={:.2}ms",
+                "[{:.3}s] h264 encode: output={:.1}fps fresh={} repeated={} | scale+yuv avg={:.2}ms max={:.2}ms | encode+queue avg={:.2}ms max={:.2}ms",
                 started.elapsed().as_secs_f64(),
-                encoded_ticks as f64 / window_s,
+                output_frames as f64 / window_s,
                 fresh_frames,
                 repeated_frames,
                 conversion_total_ms / fresh_frames.max(1) as f64,
@@ -286,6 +363,7 @@ fn encode_captured_frames(
             );
             report_since = Instant::now();
             encoded_ticks = 0;
+            output_frames = 0;
             fresh_frames = 0;
             repeated_frames = 0;
             conversion_total_ms = 0.0;
@@ -297,25 +375,22 @@ fn encode_captured_frames(
     Ok(())
 }
 
-pub async fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
+#[cfg(target_os = "linux")]
+pub async fn cast_h264(receiver_addr: &str, native: bool) -> Result<(), Box<dyn Error>> {
     eprintln!("h264 cast: querying shareable displays");
     let authorized = crate::screen::ShareScreen::full_monitor()
         .authorize()
         .await?;
-    let stream = authorized.stream_spec()?;
-    if stream.width % 2 != 0 || stream.height % 2 != 0 {
-        return Err("H.264 YUV420 capture requires even monitor dimensions".into());
-    }
+    let (remote, stream, capture, frames) = authorized.connect_pipewire()?;
+    let size = encode_size(stream.width as usize, stream.height as usize, native);
     let encoder = LinuxH264Encoder::new()?;
-    let (capture, frames) = Pipeline::new(stream).into_ports();
-    let remote = authorized.connect_pipewire(capture.clone(), stream)?;
     let (outbound, sending_thread) = start_h264_sender(receiver_addr)?;
     let stopping = Arc::new(AtomicBool::new(false));
     let encoder_stop = Arc::clone(&stopping);
     let encoding_thread = thread::Builder::new()
         .name("melquiades-h264-encoder".into())
         .spawn(move || {
-            let result = encode_captured_frames(frames, stream, outbound, encoder)
+            let result = encode_captured_frames(frames, stream, size, outbound, encoder)
                 .map_err(|error| error.to_string());
             encoder_stop.store(true, Ordering::Release);
             result
@@ -335,8 +410,8 @@ pub async fn cast_h264(receiver_addr: &str) -> Result<(), Box<dyn Error>> {
         result
     });
     eprintln!(
-        "H.264 capture: {}x{}, up to 30fps, 8 Mbps -> {receiver_addr}; press Ctrl-C to stop",
-        stream.width, stream.height
+        "h264 capture {}x{} -> encode {}x{}, target {H264_TARGET_FPS} fps -> {receiver_addr}",
+        stream.width, stream.height, size.0, size.1
     );
     let capture_result = remote.run_until(move || stopping.load(Ordering::Acquire));
     capture.stop();
@@ -369,30 +444,32 @@ mod tests {
         receiver
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let stream = StreamSpec::new(64, 64, PixelFormat::Bgra8888).unwrap();
+        let stream = StreamSpec::new(2560, 1440, PixelFormat::Bgra8888).unwrap();
         let (capture, frames) = Pipeline::new(stream).into_ports();
         let (outbound, sender) =
             start_h264_sender(&receiver.local_addr().unwrap().to_string()).unwrap();
         let encoder = LinuxH264Encoder::new().unwrap();
         let worker = thread::spawn(move || {
-            encode_captured_frames(frames, stream, outbound, encoder).map_err(|e| e.to_string())
+            let size = encode_size(stream.width as usize, stream.height as usize, false);
+            encode_captured_frames(frames, stream, size, outbound, encoder)
+                .map_err(|e| e.to_string())
         });
-        let now = Instant::now();
-        // Red BGRx pixels, with padding to exercise PipeWire row packing.
-        let stride = 64 * 4 + 16;
-        let mut pixels = vec![0; stride * 64];
+        let row_bytes = stream.width as usize * 4;
+        let stride = row_bytes + 16;
+        let mut pixels = vec![0; stride * stream.height as usize];
         for row in pixels.chunks_exact_mut(stride) {
-            for pixel in row[..256].chunks_exact_mut(4) {
+            for pixel in row[..row_bytes].chunks_exact_mut(4) {
                 pixel.copy_from_slice(&[0, 0, 255, 0]);
             }
         }
+        let now = Instant::now();
         capture
             .publish_strided(
                 FrameInfo {
                     capture_begins_at: now,
                     captured_at: now,
-                    width: 64,
-                    height: 64,
+                    width: stream.width,
+                    height: stream.height,
                     format: PixelFormat::Bgra8888,
                     byte_len: stream.byte_len,
                 },
@@ -424,11 +501,66 @@ mod tests {
             .decode_access_unit(&assembly.buf[..assembly.bytes])
             .unwrap()
             .unwrap();
-        assert_eq!(decoded.stream, stream);
+        assert_eq!((decoded.stream.width, decoded.stream.height), (960, 540));
         let pixel = &decoded.pixels[..4];
         assert!(
             pixel[2] > 200 && pixel[0] < 40 && pixel[1] < 40,
             "wrong BGRA color: {pixel:?}"
+        );
+    }
+
+    #[test]
+    fn stream_dimensions_fit_the_cpu_budget() {
+        assert_eq!(encode_size(1920, 1080, false), (960, 540));
+        assert_eq!(encode_size(1440, 2560, false), (540, 960));
+        assert_eq!(encode_size(641, 481, false), (640, 480));
+        assert_eq!(encode_size(512, 384, false), (512, 384));
+        assert_eq!(encode_size(2560, 1440, true), (2560, 1440));
+    }
+
+    #[test]
+    fn display_recovers_from_loss_and_sender_restart() {
+        let socket = crate::transport::bind_h264_display("127.0.0.1:0").unwrap();
+        let timeout = Duration::from_secs(3);
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        let (tx, display) = sync_channel(8);
+        let receiver = thread::spawn(move || {
+            crate::transport::receiving_h264_to_display(socket, tx, || {})
+                .map_err(|e| e.to_string())
+        });
+        let mut sender = H264UdpSender::connect(&addr).unwrap();
+        let mut encoder = LinuxH264Encoder::new().unwrap();
+        let pixels = vec![128; 64 * 64 * 4];
+        let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&pixels, (64, 64)));
+        let (outbound, frames) = sync_channel(1);
+        for (id, pts) in [0, 33_333, 250_000, 283_333, 316_666, 1_250_000]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(encoder.encode_and_send(&yuv, pts, &outbound).unwrap());
+            let frame = frames.recv().unwrap();
+            assert_eq!(
+                frame.is_keyframe && frame.has_parameter_sets,
+                matches!(id, 0 | 2 | 5)
+            );
+            if !matches!(id, 0 | 3) {
+                sender.send_access_unit(&frame).unwrap();
+            }
+        }
+        assert_eq!(display.recv_timeout(timeout).unwrap().frame_id, 2);
+        assert_eq!(display.recv_timeout(timeout).unwrap().frame_id, 5);
+        let mut restarted = H264UdpSender::connect(&addr).unwrap();
+        let mut encoder = LinuxH264Encoder::new().unwrap();
+        encoder.encode_and_send(&yuv, 0, &outbound).unwrap();
+        restarted.send_access_unit(&frames.recv().unwrap()).unwrap();
+        assert_eq!(display.recv_timeout(timeout).unwrap().frame_id, 0);
+        drop(display);
+        encoder.encode_and_send(&yuv, 33_333, &outbound).unwrap();
+        restarted.send_access_unit(&frames.recv().unwrap()).unwrap();
+        assert_eq!(
+            receiver.join().unwrap().unwrap_err(),
+            "display frame channel disconnected"
         );
     }
 

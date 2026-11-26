@@ -28,7 +28,7 @@ use pipewire::{
 use zbus::Connection;
 
 use crate::capture::{FrameInfo, PixelFormat, StreamSpec};
-use crate::pipeline::{CapturePort, CapturePublish, Pipeline};
+use crate::pipeline::{CapturePort, CapturePublish, Pipeline, SenderPort};
 use crate::transport::stream_from_sender;
 
 /// The intentionally narrow first `cast` request: the portal lets the user
@@ -54,8 +54,7 @@ impl ShareScreen {
             .enable_all()
             .build()?;
         let authorized = runtime.block_on(self.authorize())?;
-        let stream = authorized.stream_spec()?;
-        let (capture, sender) = Pipeline::new(stream).into_ports();
+        let (remote, stream, _, sender) = authorized.connect_pipewire()?;
 
         // PipeWire objects are deliberately !Send. Its event loop remains on
         // this thread while sender owns the other end of our lock-free handoff
@@ -70,7 +69,6 @@ impl ShareScreen {
                 }
             })?;
 
-        let remote = authorized.connect_pipewire(capture, stream)?;
         eprintln!(
             "PipeWire screen capture connected: node={} stream={}x{} {:?}; sending to {receiver_addr}",
             remote.node_id, stream.width, stream.height, stream.format,
@@ -136,7 +134,6 @@ impl ShareScreen {
             .await?;
         Ok(AuthorizedScreen {
             node_id,
-            compositor_size,
             session,
             remote_fd,
         })
@@ -147,30 +144,16 @@ impl ShareScreen {
 /// monitor permission alive too.
 pub(crate) struct AuthorizedScreen {
     node_id: u32,
-    compositor_size: Option<(i32, i32)>,
     session: Session<Screencast>,
     remote_fd: OwnedFd,
 }
 
 impl AuthorizedScreen {
-    pub(crate) fn stream_spec(&self) -> Result<StreamSpec, Box<dyn Error>> {
-        let (width, height) = self
-            .compositor_size
-            .ok_or("portal did not report the selected monitor dimensions")?;
-        let width = u32::try_from(width).map_err(|_| "portal reported a negative monitor width")?;
-        let height =
-            u32::try_from(height).map_err(|_| "portal reported a negative monitor height")?;
-        StreamSpec::new(width, height, PixelFormat::Bgra8888)
-    }
-
     pub(crate) fn connect_pipewire(
         self,
-        capture: CapturePort,
-        expected_stream: StreamSpec,
-    ) -> Result<PipeWireRemote, Box<dyn Error>> {
+    ) -> Result<(PipeWireRemote, StreamSpec, CapturePort, SenderPort), Box<dyn Error>> {
         let Self {
             node_id,
-            compositor_size: _,
             session,
             remote_fd,
         } = self;
@@ -190,8 +173,10 @@ impl AuthorizedScreen {
         )?;
 
         let loop_on_error = main_loop.clone();
+        let loop_on_format = main_loop.clone();
+        let (ready, negotiated) = std::sync::mpsc::channel();
         let listener = stream
-            .add_local_listener_with_user_data(ScreenCaptureState::new(capture, expected_stream))
+            .add_local_listener_with_user_data(ScreenCaptureState::default())
             .state_changed(move |_, state, old, new| {
                 eprintln!("PipeWire screen stream state: {old:?} -> {new:?}");
                 if matches!(
@@ -199,55 +184,80 @@ impl AuthorizedScreen {
                     pipewire::stream::StreamState::Error(_)
                         | pipewire::stream::StreamState::Unconnected
                 ) {
-                    state.capture.stop();
+                    if let Some((_, capture)) = &state.output {
+                        capture.stop();
+                    }
                     loop_on_error.quit();
                 }
             })
-            .param_changed(|_, state, id, param| {
-                state.observe_format(id, param);
+            .param_changed(move |_, state, id, param| {
+                if id != spa::param::ParamType::Format.as_raw() {
+                    return;
+                }
+                state.negotiated_format = false;
+                let Some(param) = param else { return };
+                let result = ScreenCaptureState::stream_spec(param);
+                if let Some((previous, capture)) = &state.output {
+                    state.negotiated_format = result.as_ref().ok() == Some(previous);
+                    if !state.negotiated_format {
+                        eprintln!("screen format changed, restart capture to select the new mode");
+                        capture.stop();
+                        loop_on_format.quit();
+                    }
+                    return;
+                }
+                let _ = ready.send(
+                    result
+                        .map(|spec| {
+                            let (capture, sender) = Pipeline::new(spec).into_ports();
+                            state.output = Some((spec, capture.clone()));
+                            state.negotiated_format = true;
+                            (spec, capture, sender)
+                        })
+                        .map_err(|e| e.to_string()),
+                );
+                loop_on_format.quit();
             })
             .process(|stream, state| {
                 state.capture_one(stream);
             })
             .register()?;
 
-        // `BGRx` has the byte order B, G, R, unused-X in memory. That is
-        // compatible with our Bgra8888 consumer because it ignores alpha.
-        // Asking for exactly this raw format avoids a later colorspace stage.
-        let format = spa::pod::object!(
-            spa::utils::SpaTypes::ObjectParamFormat,
-            spa::param::ParamType::EnumFormat,
-            spa::pod::property!(
-                spa::param::format::FormatProperties::MediaType,
-                Id,
-                spa::param::format::MediaType::Video
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::MediaSubtype,
-                Id,
-                spa::param::format::MediaSubtype::Raw
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoFormat,
-                Id,
-                spa::param::video::VideoFormat::BGRx
-            ),
-            spa::pod::property!(
-                spa::param::format::FormatProperties::VideoSize,
-                Rectangle,
-                spa::utils::Rectangle {
-                    width: expected_stream.width,
-                    height: expected_stream.height,
-                }
-            ),
-        );
-        let bytes = spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &spa::pod::Value::Object(format),
-        )?
-        .0
-        .into_inner();
-        let mut params = [Pod::from_bytes(&bytes).ok_or("failed to build PipeWire format pod")?];
+        let format = |pixel_format: spa::param::video::VideoFormat| {
+            spa::pod::object!(
+                spa::utils::SpaTypes::ObjectParamFormat,
+                spa::param::ParamType::EnumFormat,
+                spa::pod::property!(
+                    spa::param::format::FormatProperties::MediaType,
+                    Id,
+                    spa::param::format::MediaType::Video
+                ),
+                spa::pod::property!(
+                    spa::param::format::FormatProperties::MediaSubtype,
+                    Id,
+                    spa::param::format::MediaSubtype::Raw
+                ),
+                spa::pod::property!(
+                    spa::param::format::FormatProperties::VideoFormat,
+                    Id,
+                    pixel_format
+                ),
+            )
+        };
+        let serialize = |pixel_format| -> Result<Vec<u8>, Box<dyn Error>> {
+            Ok(spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &spa::pod::Value::Object(format(pixel_format)),
+            )?
+            .0
+            .into_inner())
+        };
+        let bgrx = serialize(spa::param::video::VideoFormat::BGRx)?;
+        let bgra = serialize(spa::param::video::VideoFormat::BGRA)?;
+        let mut params = [
+            Pod::from_bytes(&bgrx).ok_or("invalid bgrx format pod")?,
+            Pod::from_bytes(&bgra).ok_or("invalid bgra format pod")?,
+        ];
         stream.connect(
             spa::utils::Direction::Input,
             Some(node_id),
@@ -255,22 +265,40 @@ impl AuthorizedScreen {
             &mut params,
         )?;
 
-        Ok(PipeWireRemote {
-            node_id,
-            _session: session,
-            _listener: listener,
-            _stream: stream,
-            _core: core,
-            main_loop,
-        })
+        let loop_on_timeout = main_loop.clone();
+        let timer = main_loop.loop_().add_timer(move |_| loop_on_timeout.quit());
+        timer
+            .update_timer(Some(std::time::Duration::from_secs(10)), None)
+            .into_result()?;
+        main_loop.run();
+        drop(timer);
+        let (spec, capture, sender) = negotiated.try_recv().map_err(|_| {
+            format!(
+                "pipewire ended format negotiation without a format ({:?})",
+                stream.state()
+            )
+        })??;
+        Ok((
+            PipeWireRemote {
+                node_id,
+                _session: session,
+                _listener: listener,
+                _stream: stream,
+                _core: core,
+                main_loop,
+            },
+            spec,
+            capture,
+            sender,
+        ))
     }
 }
 
 /// State owned by PipeWire's one capture callback. It never allocates or
 /// waits: it either publishes one packed frame to the pool or drops it.
+#[derive(Default)]
 struct ScreenCaptureState {
-    capture: CapturePort,
-    expected_stream: StreamSpec,
+    output: Option<(StreamSpec, CapturePort)>,
     negotiated_format: bool,
     callbacks: u64,
     published: u64,
@@ -279,68 +307,27 @@ struct ScreenCaptureState {
 }
 
 impl ScreenCaptureState {
-    fn new(capture: CapturePort, expected_stream: StreamSpec) -> Self {
-        Self {
-            capture,
-            expected_stream,
-            negotiated_format: false,
-            callbacks: 0,
-            published: 0,
-            malformed: 0,
-            rejected_format: 0,
-        }
-    }
-
-    fn observe_format(&mut self, id: u32, param: Option<&Pod>) {
-        if id != spa::param::ParamType::Format.as_raw() {
-            return;
-        }
-        let Some(param) = param else {
-            self.negotiated_format = false;
-            eprintln!("PipeWire cleared the screen stream format");
-            return;
-        };
-        let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param) else {
-            self.negotiated_format = false;
-            eprintln!("PipeWire returned an unreadable screen format");
-            return;
-        };
+    fn stream_spec(param: &Pod) -> Result<StreamSpec, Box<dyn Error>> {
+        let (media_type, media_subtype) = spa::param::format_utils::parse_format(param)
+            .map_err(|e| format!("invalid pipewire format: {e:?}"))?;
         if media_type != spa::param::format::MediaType::Video
             || media_subtype != spa::param::format::MediaSubtype::Raw
         {
-            self.negotiated_format = false;
-            eprintln!("PipeWire did not negotiate raw video for the selected monitor");
-            return;
+            return Err("pipewire did not negotiate raw video".into());
         }
 
         let mut format = spa::param::video::VideoInfoRaw::new();
-        if let Err(error) = format.parse(param) {
-            self.negotiated_format = false;
-            eprintln!("could not parse PipeWire screen format: {error}");
-            return;
-        }
+        format
+            .parse(param)
+            .map_err(|e| format!("invalid video format: {e}"))?;
         let size = format.size();
-        self.negotiated_format = format.format() == spa::param::video::VideoFormat::BGRx
-            && size.width == self.expected_stream.width
-            && size.height == self.expected_stream.height;
-        if self.negotiated_format {
-            eprintln!(
-                "PipeWire negotiated BGRx {}x{} at {}/{} fps; copying into tight BGRA pool slots",
-                size.width,
-                size.height,
-                format.framerate().num,
-                format.framerate().denom,
-            );
-        } else {
-            eprintln!(
-                "unsupported PipeWire screen format: {:?} {}x{}; expected BGRx {}x{}",
-                format.format(),
-                size.width,
-                size.height,
-                self.expected_stream.width,
-                self.expected_stream.height,
-            );
+        if !matches!(
+            format.format(),
+            spa::param::video::VideoFormat::BGRx | spa::param::video::VideoFormat::BGRA
+        ) {
+            return Err(format!("unsupported pipewire pixel format {:?}", format.format()).into());
         }
+        StreamSpec::new(size.width, size.height, PixelFormat::Bgra8888)
     }
 
     fn capture_one(&mut self, stream: &pipewire::stream::Stream) {
@@ -388,15 +375,18 @@ impl ScreenCaptureState {
             return;
         };
 
+        let Some((spec, capture)) = &self.output else {
+            return;
+        };
         let info = FrameInfo {
             capture_begins_at,
-            width: self.expected_stream.width,
-            height: self.expected_stream.height,
-            format: PixelFormat::Bgra8888,
-            byte_len: self.expected_stream.byte_len,
+            width: spec.width,
+            height: spec.height,
+            format: spec.format,
+            byte_len: spec.byte_len,
             captured_at: Instant::now(),
         };
-        match self.capture.publish_strided(info, source, stride) {
+        match capture.publish_strided(info, source, stride) {
             Ok(CapturePublish::Published) => self.published += 1,
             Ok(CapturePublish::DroppedNoFreeSlot) => {}
             Err(error) => {

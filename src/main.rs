@@ -3,11 +3,12 @@ mod codec;
 mod color;
 mod compression;
 mod config;
-mod prediction;
 mod display;
 mod metrics;
 mod pipeline;
 mod reassembly;
+#[cfg(target_os = "windows")]
+mod recording;
 mod spsc;
 mod time;
 mod transport;
@@ -40,11 +41,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         Some("cast-h264") => {
             let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:5000");
-            #[cfg(target_os = "macos")]
-            return codec::macos::cast_h264(addr)?;
             #[cfg(target_os = "linux")]
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            return rt.block_on(codec::linux::cast_h264(addr));
+            {
+                let native = match args.get(3).map(String::as_str) {
+                    None => false,
+                    Some("--native") => true,
+                    Some(_) => return Err("usage: cast-h264 receiver:port [--native]".into()),
+                };
+                tokio::runtime::Runtime::new()?.block_on(codec::linux::cast_h264(addr, native))?;
+            }
+            #[cfg(target_os = "macos")]
+            codec::macos::cast_h264(addr)?;
         }
         #[cfg(target_os = "linux")]
         Some("cam") => {

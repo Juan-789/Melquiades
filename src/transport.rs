@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use crate::capture::{FrameSource, StreamSpec};
 #[cfg(target_os = "linux")]
-use crate::codec::linux::LinuxH264Decoder;
+use crate::codec::linux::LinuxH264Decoder as H264Decoder;
 #[cfg(target_os = "windows")]
-use crate::codec::windows::WindowsH264Decoder;
+use crate::codec::windows::WindowsH264Decoder as H264Decoder;
 use crate::codec::{Codec, EncodedFrame};
 use crate::compression::{compress, decompress};
 use crate::config::{
@@ -148,7 +148,7 @@ impl H264UdpSender {
             first_datagram_accepted.get_or_insert(accepted_at);
             final_datagram_accepted = Some(accepted_at);
             if index + 1 < total_chunks {
-               pace_after_send(accepted_at);
+                pace_after_send(accepted_at);
             }
         }
         Ok(H264SendReport {
@@ -326,6 +326,7 @@ pub struct ReceivedFrame {
     pub stream: StreamSpec,
     pub timings: FrameTimings,
     pub frame_id: u32,
+    pub display_channel_drops: u64,
 }
 
 pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn std::error::Error>> {
@@ -337,6 +338,7 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
     let mut decompressed = Vec::new();
     let mut echo_bytes = [0; ECHO_BYTES];
     let mut reassembly_stats = ReassemblyStats::new();
+    let mut display_channel_drops = 0_u64;
 
     loop {
         let (received, source) = socket.recv_from(&mut datagram)?;
@@ -427,8 +429,14 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
                                 t2_decode_ends,
                             },
                             frame_id: reassembler.frame_id,
+                            display_channel_drops,
                         };
-                        let _ = tx.try_send(frame);
+                        if matches!(
+                            tx.try_send(frame),
+                            Err(std::sync::mpsc::TrySendError::Full(_))
+                        ) {
+                            display_channel_drops += 1;
+                        }
                     }
                     None => {
                         output.write_all(&decompressed)?;
@@ -450,7 +458,6 @@ pub fn receiving(tx: Option<SyncSender<ReceivedFrame>>) -> Result<(), Box<dyn st
 /// Mac H.264 sender and Linux transport agree on fragmentation, frame IDs,
 /// flags, and reassembly before a decoder is asked to process network input.
 pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
-    
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
@@ -464,11 +471,7 @@ pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
         socket.recv_buffer_size()?
     );
 
-    socket.bind(
-        &"0.0.0.0:5000"
-            .parse::<std::net::SocketAddr>()?
-            .into(),
-    )?;
+    socket.bind(&"0.0.0.0:5000".parse::<std::net::SocketAddr>()?.into())?;
 
     let socket: UdpSocket = socket.into();
 
@@ -528,16 +531,8 @@ pub fn receiving_h264() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Linux receiver path that turns completed H.264 access units into display
-/// frames. This stays separate from `receiving_h264()` so the latter remains
-/// a quiet, decoder-independent packetization diagnostic.
-#[cfg(target_os = "linux")]
-pub fn receiving_h264_to_display(
-    tx: SyncSender<ReceivedFrame>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Configure before binding so the first keyframe burst gets the larger
-    // queue too. Linux caps the request at rmem_max and reports a doubled
-    // value for packet accounting; log the actual kernel value.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub fn bind_h264_display(addr: &str) -> Result<UdpSocket, Box<dyn std::error::Error>> {
     const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -547,187 +542,128 @@ pub fn receiving_h264_to_display(
     socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES)?;
     let effective_buffer_bytes = socket.recv_buffer_size()?;
     eprintln!(
-        "H.264 UDP receive buffer: requested={RECEIVE_BUFFER_BYTES} bytes, effective={effective_buffer_bytes} bytes (Linux accounting includes doubling); verify with ss -u -a -m -n 'sport = :5000'"
+        "H.264 UDP receive buffer: requested={RECEIVE_BUFFER_BYTES} bytes, effective={effective_buffer_bytes} bytes"
     );
-    socket.bind(&"0.0.0.0:5000".parse::<std::net::SocketAddr>()?.into())?;
-    let socket: UdpSocket = socket.into();
-    let mut datagram = vec![0; DATAGRAM_MAX];
-    let mut reassembler = H264Reassembler::new();
-    let mut decoder = LinuxH264Decoder::new()?;
-    // Joining a live stream in the middle of a GOP, or losing any fragment,
-    // means P-frames no longer have a reliable reference picture. Refuse them
-    // until an IDR that carries SPS/PPS repairs decoder state.
-    let mut waiting_for_recovery_keyframe = true;
-    let mut skipped_while_waiting = 0_u64;
-
-    eprintln!("waiting for decoder-ready JUAN H.264 on UDP port 5000");
-    loop {
-        let (received, _) = socket.recv_from(&mut datagram)?;
-        let Some((header, payload)) = PacketHeader::split_datagram(&datagram[..received]) else {
-            eprintln!("malformed H.264 packet: {received} bytes");
-            continue;
-        };
-
-        if header.frame_id != reassembler.frame_id {
-            if !reassembler.is_newer_frame(header.frame_id) {
-                continue;
-            }
-            if reassembler.total_chunks > 0 && reassembler.missing() > 0 {
-                eprintln!(
-                    "H.264 frame {} lost: {} of {} packets missing; waiting for a recovery keyframe",
-                    reassembler.frame_id,
-                    reassembler.missing(),
-                    reassembler.total_chunks,
-                );
-                waiting_for_recovery_keyframe = true;
-            }
-            if !reassembler.reset(&header) {
-                eprintln!(
-                    "refused H.264 frame {}: {} packets exceed the safety limit",
-                    header.frame_id, header.total_chunks
-                );
-                waiting_for_recovery_keyframe = true;
-                continue;
-            }
-        }
-        if !reassembler.add(&header, payload) {
-            continue;
-        }
-
-        let is_keyframe = reassembler.flags & FLAG_KEYFRAME != 0;
-        let has_parameter_sets = reassembler.flags & FLAG_PARAMETER_SETS != 0;
-        if waiting_for_recovery_keyframe {
-            if !is_keyframe || !has_parameter_sets {
-                skipped_while_waiting += 1;
-                continue;
-            }
-            // A fresh decoder guarantees an IDR after loss cannot retain a
-            // damaged reference picture from the previous GOP.
-            decoder = LinuxH264Decoder::new()?;
-            waiting_for_recovery_keyframe = false;
-            eprintln!(
-                "H.264 recovery at keyframe {} after skipping {skipped_while_waiting} access units",
-                reassembler.frame_id
-            );
-            skipped_while_waiting = 0;
-        }
-
-        let t0_complete = Instant::now();
-        let t1_decode_begins = Instant::now();
-        let decoded = decoder.decode_access_unit(&reassembler.buf[..reassembler.bytes]);
-        let t2_decode_ends = Instant::now();
-        match decoded {
-            Ok(Some(frame)) => {
-                let _ = tx.try_send(ReceivedFrame {
-                    pixels: frame.pixels,
-                    stream: frame.stream,
-                    timings: FrameTimings {
-                        t0_compressed_frame_complete: t0_complete,
-                        t1_decode_begins,
-                        t2_decode_ends,
-                    },
-                    frame_id: reassembler.frame_id,
-                });
-            }
-            Ok(None) => {
-                // Normally only occurs before the first complete IDR. If it
-                // happens after one, conservatively wait for the next repair
-                // point rather than presenting an older image indefinitely.
-                waiting_for_recovery_keyframe = true;
-                eprintln!(
-                    "H.264 decoder produced no picture for frame {}; waiting for a keyframe",
-                    reassembler.frame_id
-                );
-            }
-            Err(error) => {
-                waiting_for_recovery_keyframe = true;
-                eprintln!(
-                    "H.264 decode failed for frame {}: {error}; waiting for a keyframe",
-                    reassembler.frame_id
-                );
-            }
-        }
-    }
+    socket.bind(&addr.parse::<std::net::SocketAddr>()?.into())?;
+    Ok(socket.into())
 }
 
-/// Windows receiver path that turns completed H.264 access units into display
-/// frames. This stays separate from `receiving_h264()` so the latter remains
-/// a quiet, decoder-independent packetization diagnostic.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn receiving_h264_to_display(
+    socket: UdpSocket,
     tx: SyncSender<ReceivedFrame>,
+    mut on_frame: impl FnMut(),
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-// Configure before binding so the first keyframe burst gets the larger
-    // queue too. Linux caps the request at rmem_max and reports a doubled
-    // value for packet accounting; log the actual kernel value.
-    const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_recv_buffer_size(RECEIVE_BUFFER_BYTES)?;
-    let effective_buffer_bytes = socket.recv_buffer_size()?;
-    eprintln!(
-        "H.264 UDP receive buffer: requested={RECEIVE_BUFFER_BYTES} bytes, effective={effective_buffer_bytes} bytes (Linux accounting includes doubling); verify with ss -u -a -m -n 'sport = :5000'"
-    );
-    socket.bind(&"0.0.0.0:5000".parse::<std::net::SocketAddr>()?.into())?;
-    let socket: UdpSocket = socket.into();
     let mut datagram = vec![0; DATAGRAM_MAX];
     let mut reassembler = H264Reassembler::new();
-    let mut decoder = WindowsH264Decoder::new()?;
-    // Joining a live stream in the middle of a GOP, or losing any fragment,
-    // means P-frames no longer have a reliable reference picture. Refuse them
-    // until an IDR that carries SPS/PPS repairs decoder state.
-    let mut waiting_for_recovery_keyframe = true;
+    let mut decoder = None;
+    let mut peer = None;
+    let mut retired_peer = None;
+    let mut last_accepted = Instant::now();
+    let mut startup_at = None;
     let mut skipped_while_waiting = 0_u64;
 
-    eprintln!("waiting for decoder-ready JUAN H.264 on UDP port 5000");
+    let telemetry_started = Instant::now();
+    let mut telemetry_since = Instant::now();
+    let mut packets_received = 0_u64;
+    let mut bytes_received = 0_u64;
+    let mut completed_access_units = 0_u64;
+    let mut lost_access_units = 0_u64;
+    let mut late_or_old_packets = 0_u64;
+    let mut decode_calls = 0_u64;
+    let mut decode_pictures = 0_u64;
+    let mut decode_none = 0_u64;
+    let mut decode_errors = 0_u64;
+    let mut decode_total_ms = 0.0_f64;
+    let mut decode_max_ms = 0.0_f64;
+    let mut channel_sent = 0_u64;
+    let mut channel_full_drops = 0_u64;
+    let mut last_packet_at: Option<Instant> = None;
+    let mut max_packet_gap_ms = 0.0_f64;
+
+    eprintln!("waiting for h264 on {}", socket.local_addr()?);
     loop {
-        let (received, _) = socket.recv_from(&mut datagram)?;
+        let (received, source) = socket.recv_from(&mut datagram)?;
+        let packet_at = Instant::now();
+        packets_received += 1;
+        bytes_received += received as u64;
+        if let Some(previous) = last_packet_at {
+            max_packet_gap_ms =
+                max_packet_gap_ms.max(packet_at.duration_since(previous).as_secs_f64() * 1000.0);
+        }
+        last_packet_at = Some(packet_at);
         let Some((header, payload)) = PacketHeader::split_datagram(&datagram[..received]) else {
             eprintln!("malformed H.264 packet: {received} bytes");
             continue;
         };
 
-        if header.frame_id != reassembler.frame_id {
-            if !reassembler.is_newer_frame(header.frame_id) {
+        let recovery_flags = FLAG_KEYFRAME | FLAG_PARAMETER_SETS;
+        let recovery = header.flags & recovery_flags == recovery_flags;
+        let idle = packet_at.duration_since(last_accepted) >= std::time::Duration::from_secs(1);
+        let restarted = idle && recovery && header.frame_id < reassembler.frame_id;
+        if peer != Some(source) || restarted {
+            if peer.is_some() && (!recovery || (retired_peer == Some(source) && !idle)) {
                 continue;
             }
+            if peer != Some(source) {
+                retired_peer = peer;
+            }
+            peer = Some(source);
+            startup_at = Some(packet_at);
+            telemetry_since = packet_at;
+            eprintln!(
+                "first stream packet from {source}, frame {}",
+                header.frame_id
+            );
+            reassembler = H264Reassembler::new();
+            decoder = None;
+            skipped_while_waiting = 0;
+        }
+        if reassembler.total_chunks == 0 || header.frame_id != reassembler.frame_id {
+            if reassembler.total_chunks != 0 && !reassembler.is_newer_frame(header.frame_id) {
+                late_or_old_packets += 1;
+                continue;
+            }
+            if reassembler.total_chunks != 0 {
+                let absent = header.frame_id.wrapping_sub(reassembler.frame_id) - 1;
+                if absent > 0 {
+                    lost_access_units += u64::from(absent);
+                    decoder = None;
+                }
+            }
             if reassembler.total_chunks > 0 && reassembler.missing() > 0 {
+                lost_access_units += 1;
                 eprintln!(
                     "H.264 frame {} lost: {} of {} packets missing; waiting for a recovery keyframe",
                     reassembler.frame_id,
                     reassembler.missing(),
                     reassembler.total_chunks,
                 );
-                waiting_for_recovery_keyframe = true;
+                decoder = None;
             }
             if !reassembler.reset(&header) {
                 eprintln!(
                     "refused H.264 frame {}: {} packets exceed the safety limit",
                     header.frame_id, header.total_chunks
                 );
-                waiting_for_recovery_keyframe = true;
+                decoder = None;
                 continue;
             }
         }
+        last_accepted = packet_at;
         if !reassembler.add(&header, payload) {
             continue;
         }
+        completed_access_units += 1;
 
         let is_keyframe = reassembler.flags & FLAG_KEYFRAME != 0;
         let has_parameter_sets = reassembler.flags & FLAG_PARAMETER_SETS != 0;
-        if waiting_for_recovery_keyframe {
+        if decoder.is_none() {
             if !is_keyframe || !has_parameter_sets {
                 skipped_while_waiting += 1;
                 continue;
             }
-            // A fresh decoder guarantees an IDR after loss cannot retain a
-            // damaged reference picture from the previous GOP.
-            decoder = WindowsH264Decoder::new()?;
-            waiting_for_recovery_keyframe = false;
+            decoder = Some(H264Decoder::new()?);
             eprintln!(
                 "H.264 recovery at keyframe {} after skipping {skipped_while_waiting} access units",
                 reassembler.frame_id
@@ -737,11 +673,29 @@ pub fn receiving_h264_to_display(
 
         let t0_complete = Instant::now();
         let t1_decode_begins = Instant::now();
-        let decoded = decoder.decode_access_unit(&reassembler.buf[..reassembler.bytes]);
+        let decoded = decoder
+            .as_mut()
+            .unwrap()
+            .decode_access_unit(&reassembler.buf[..reassembler.bytes]);
         let t2_decode_ends = Instant::now();
+        decode_calls += 1;
+        let decode_ms = t2_decode_ends
+            .duration_since(t1_decode_begins)
+            .as_secs_f64()
+            * 1000.0;
+        decode_total_ms += decode_ms;
+        decode_max_ms = decode_max_ms.max(decode_ms);
         match decoded {
             Ok(Some(frame)) => {
-                let _ = tx.try_send(ReceivedFrame {
+                decode_pictures += 1;
+                if let Some(start) = startup_at.take() {
+                    eprintln!(
+                        "first picture {} decoded {:.2} ms after first stream packet",
+                        reassembler.frame_id,
+                        t2_decode_ends.duration_since(start).as_secs_f64() * 1000.0
+                    );
+                }
+                match tx.try_send(ReceivedFrame {
                     pixels: frame.pixels,
                     stream: frame.stream,
                     timings: FrameTimings {
@@ -750,25 +704,73 @@ pub fn receiving_h264_to_display(
                         t2_decode_ends,
                     },
                     frame_id: reassembler.frame_id,
-                });
+                    display_channel_drops: channel_full_drops,
+                }) {
+                    Ok(()) => {
+                        channel_sent += 1;
+                        on_frame();
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => channel_full_drops += 1,
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return Err("display frame channel disconnected".into());
+                    }
+                }
             }
             Ok(None) => {
-                // Normally only occurs before the first complete IDR. If it
-                // happens after one, conservatively wait for the next repair
-                // point rather than presenting an older image indefinitely.
-                waiting_for_recovery_keyframe = true;
+                decode_none += 1;
+                decoder = None;
                 eprintln!(
                     "H.264 decoder produced no picture for frame {}; waiting for a keyframe",
                     reassembler.frame_id
                 );
             }
             Err(error) => {
-                waiting_for_recovery_keyframe = true;
+                decode_errors += 1;
+                decoder = None;
                 eprintln!(
                     "H.264 decode failed for frame {}: {error}; waiting for a keyframe",
                     reassembler.frame_id
                 );
             }
+        }
+
+        if telemetry_since.elapsed() >= std::time::Duration::from_secs(2) {
+            let window_s = telemetry_since.elapsed().as_secs_f64();
+            let uptime_s = telemetry_started.elapsed().as_secs_f64();
+            eprintln!(
+                "[{uptime_s:8.3}s] H264 RX: packets={:.1}/s bytes={:.2}MB/s complete={:.1}fps lost={} old_pkts={} waiting={} skipped={} max_packet_gap={:.2}ms | decode calls={} pictures={} none={} errors={} avg={:.2}ms max={:.2}ms | channel sent={} full_drop={}",
+                packets_received as f64 / window_s,
+                bytes_received as f64 / window_s / 1_000_000.0,
+                completed_access_units as f64 / window_s,
+                lost_access_units,
+                late_or_old_packets,
+                decoder.is_none(),
+                skipped_while_waiting,
+                max_packet_gap_ms,
+                decode_calls,
+                decode_pictures,
+                decode_none,
+                decode_errors,
+                decode_total_ms / decode_calls.max(1) as f64,
+                decode_max_ms,
+                channel_sent,
+                channel_full_drops,
+            );
+            telemetry_since = Instant::now();
+            packets_received = 0;
+            bytes_received = 0;
+            completed_access_units = 0;
+            lost_access_units = 0;
+            late_or_old_packets = 0;
+            decode_calls = 0;
+            decode_pictures = 0;
+            decode_none = 0;
+            decode_errors = 0;
+            decode_total_ms = 0.0;
+            decode_max_ms = 0.0;
+            channel_sent = 0;
+            channel_full_drops = 0;
+            max_packet_gap_ms = 0.0;
         }
     }
 }

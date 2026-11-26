@@ -20,7 +20,7 @@ pub struct EncodedFrame {
 #[cfg(target_os = "macos")]
 pub mod macos;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, target_os = "windows")))]
 pub mod linux;
 
 #[cfg(target_os = "windows")]
